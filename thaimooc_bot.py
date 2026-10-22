@@ -22,6 +22,7 @@ thaimooc_bot.py — ไล่เรียน + ทำแบบทดสอบ Th
     python thaimooc_bot.py --list                 # ดูรายการลิงก์ที่จะทำ แล้วออก
     python thaimooc_bot.py --learn                # เรียนให้จบก่อน แล้วค่อยทำแบบทดสอบ
     python thaimooc_bot.py --skip-done            # ข้ามหน่วยที่ทำเสร็จแล้ว
+    python thaimooc_bot.py --no-retry-wrong       # ตอบผิดแล้วไม่ต้องลองตัวเลือกอื่น
     python thaimooc_bot.py --no-quiz              # เรียน/เปิดหน่วยอย่างเดียว ไม่ทำแบบทดสอบ
     python thaimooc_bot.py --dry-run              # ทดสอบว่าดึงข้อมูลได้ ไม่คลิกอะไร
     python thaimooc_bot.py --exam-password 1234   # รหัสผ่านของแบบสอบ
@@ -314,11 +315,36 @@ def do_final_quiz(page: Page, course_id: str, profile: dict, args) -> None:
         print("\n(dry-run: ดูรายการอย่างเดียว ไม่เปิดหน้าและไม่คลิกอะไร)")
         return
 
+    # ---- ดึงเนื้อหาบทเรียนมาเป็นบริบทให้ AI (ทำให้ตอบตรงกับที่สอนจริง) ----
+    chapter_blocks: dict[str, dict] = {}
+    for u in targets:
+        ch = (u.get("chapter") or "").strip()
+        if ch and ch not in chapter_blocks:
+            chapter_blocks[ch] = u.get("chapter_blocks") or {"videos": [], "html": []}
+
+    texts: dict[str, str] = {}
+    if chapter_blocks:
+        try:
+            texts = bot.fetch_chapter_texts(page, course_id, chapter_blocks)
+        except Exception as e:
+            print(f"⚠️ ใช้เนื้อหาบทเรียนไม่ได้: {str(e)[:120]}")
+
+    all_text = "\n\n".join(t for t in texts.values() if t)
+
     for idx, unit in enumerate(targets, 1):
         url = absolute_url(page, unit["url"])
         kinds = "/".join(unit.get("types") or [])
         print("\n" + "-" * 52)
         print(f"📌 [{idx}/{len(targets)}] {unit['name']}  (type: {kinds})")
+
+        # เลือกบริบท: บทเรียนปกติใช้เนื้อหาบทนั้น / pre-test & final ใช้ทุกบท
+        chapter = (unit.get("chapter") or "").strip()
+        if chapter.startswith("บทที่"):
+            lesson_text = texts.get(chapter, "")
+        else:
+            lesson_text = all_text
+        if lesson_text:
+            print(f"   📚 ใช้เนื้อหาบทเรียน {len(lesson_text):,} ตัวอักษร เป็นบริบท")
 
         answered = 0
         status = "ไม่ทราบผล"
@@ -343,7 +369,10 @@ def do_final_quiz(page: Page, course_id: str, profile: dict, args) -> None:
 
             if per_problem:
                 # Open edX: ตอบ + ส่งทีละข้อ (แต่ละข้อมีปุ่ม Submit ของตัวเอง)
-                res = bot.solve_page_one_by_one(page, profile, dry_run=False)
+                res = bot.solve_page_one_by_one(
+                    page, profile, dry_run=False, context=lesson_text,
+                    chapter=chapter, retry_wrong=not getattr(args, "no_retry_wrong", False),
+                )
                 answered = res["answered"]
                 status = f"ตอบ {answered} ข้อ (ถูก {res['correct']}, ผิด {res['incorrect']})"
             else:
@@ -520,6 +549,8 @@ def main() -> None:
                         help="ทำเฉพาะแบบฝึกหัด/แบบทดสอบ (เป็นค่าเริ่มต้นอยู่แล้ว)")
     parser.add_argument("--skip-done", action="store_true",
                         help="ข้ามหน่วยที่ทำเสร็จแล้ว (ปกติจะทำซ้ำทุกหน่วย)")
+    parser.add_argument("--no-retry-wrong", action="store_true",
+                        help="ไม่ต้องลองตัวเลือกอื่นเมื่อตอบผิด (ปกติจะลองให้จนกว่าจะถูก)")
     parser.add_argument("--no-quiz", action="store_true", help="เรียนอย่างเดียว ไม่ทำแบบทดสอบ")
     parser.add_argument("--dry-run", action="store_true", help="ทดสอบดึงข้อมูลอย่างเดียว ไม่คลิกอะไร")
     parser.add_argument("--exam-password", default=None, help="รหัสผ่านของแบบสอบ")

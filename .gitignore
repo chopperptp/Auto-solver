@@ -3,3 +3,4 @@ browser_profile/
 __pycache__/
 .vscode/
 run_log*.txt
+lessons_cache.json

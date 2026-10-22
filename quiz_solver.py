@@ -260,17 +260,53 @@ def match_answer_to_index(ai_answer: str, options: list[str]) -> Optional[int]:
 _AI_CACHE: dict[str, str] = {}
 
 
-def get_answer_from_ai(question: str, options: list[str]) -> str:
-    """ส่งโจทย์และตัวเลือกให้ Gemini วิเคราะห์หาคำตอบ (ลองหลายโมเดล + retry เมื่อเจอ error ชั่วคราว)"""
-    cache_key = (question or "").strip() + "||" + "|".join(options)
+def get_answer_from_ai(
+    question: str,
+    options: list[str],
+    context: str = "",
+    chapter: str = "",
+) -> str:
+    """ส่งโจทย์และตัวเลือกให้ Gemini วิเคราะห์หาคำตอบ (ลองหลายโมเดล + retry เมื่อเจอ error ชั่วคราว)
+
+    ถ้ามี context (เนื้อหาบทเรียน) จะแนบไปให้ AI ใช้เป็นแหล่งอ้างอิงด้วย
+    """
+    cache_key = (question or "").strip() + "||" + "|".join(options) + "||" + (chapter or "")
     if cache_key in _AI_CACHE:
         return _AI_CACHE[cache_key]
 
-    prompt = f"""
-    คุณเป็นผู้เชี่ยวชาญการทำข้อสอบ โปรดอ่านโจทย์และตัวเลือกต่อไปนี้ แล้วเลือกคำตอบที่ถูกต้องที่สุดเพียงข้อเดียว
+    numbered = "\n".join(f"{i + 1}. {o}" for i, o in enumerate(options))
+
+    if context:
+        prompt = f"""
+    คุณเป็นผู้เชี่ยวชาญการทำข้อสอบรายวิชาออนไลน์
+    ด้านล่างคือ "เนื้อหาบทเรียน" ของบทที่เกี่ยวข้อง ใช้เป็นแหล่งอ้างอิงหลักในการตอบ
+
+    ==== เนื้อหาบทเรียน ====
+    {context[:80000]}
+    ==== จบเนื้อหาบทเรียน ====
 
     โจทย์: {question}
-    ตัวเลือก: {", ".join(options)}
+
+    ตัวเลือก:
+    {numbered}
+
+    วิธีคิด:
+    1) พิจารณาว่าโจทย์ถามอะไร และระวังคำถามเชิงปฏิเสธ (ยกเว้นข้อใด / ข้อใดไม่ใช่ / ข้อใดไม่ถูกต้อง) ให้เลือกตัวเลือกที่ "ไม่เข้าพวก" ตามที่โจทย์ถาม
+    2) เทียบทีละตัวเลือกกับเนื้อหาบทเรียน ถ้าเนื้อหาระบุไว้ชัด ให้ยึดตามเนื้อหา
+    3) ถ้าเนื้อหาไม่ครอบคลุม ให้ใช้ความรู้ทั่วไปที่สอดคล้องกับวิชานี้
+
+    ข้อบังคับ: ตอบเฉพาะข้อความของตัวเลือกที่ถูกต้องที่สุดเพียงข้อเดียว โดยคัดลอกข้อความมาให้ตรงทุกตัวอักษร
+    ห้ามใส่คำอธิบาย ห้ามใส่เลขข้อ
+    """
+    else:
+        prompt = f"""
+    คุณเป็นผู้เชี่ยวชาญการทำข้อสอบ โปรดอ่านโจทย์และตัวเลือกต่อไปนี้ แล้วเลือกคำตอบที่ถูกต้องที่สุดเพียงข้อเดียว
+    ระวังคำถามเชิงปฏิเสธ (ยกเว้นข้อใด / ข้อใดไม่ใช่ / ข้อใดไม่ถูกต้อง)
+
+    โจทย์: {question}
+
+    ตัวเลือก:
+    {numbered}
 
     ข้อบังคับ: ให้ตอบเฉพาะข้อความตัวเลือกที่ถูกต้องที่สุดเพียงอย่างเดียว ห้ามใส่คำอธิบาย ห้ามใส่เลขข้อ
     """
@@ -705,6 +741,31 @@ async (args) => {
 """
 
 
+_JS_FETCH_LESSONS = """
+async ({course, videos, htmls}) => {
+    const out = {videos: {}, htmls: {}};
+    for (const v of videos) {
+        try {
+            const url = `/courses/${course}/xblock/${v}/handler/transcript/download?format=txt`;
+            const r = await fetch(url, {credentials: 'include'});
+            out.videos[v] = r.ok ? await r.text() : '';
+        } catch (e) { out.videos[v] = ''; }
+    }
+    for (const h of htmls) {
+        try {
+            const r = await fetch(h, {credentials: 'include'});
+            const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+            const el = doc.querySelector('#main') || doc.querySelector('.xblock-student_view');
+            let t = (el ? el.innerText : '') || '';
+            t = t.replace(/^\\s*\\{.*?\\}\\s*/s, '');
+            out.htmls[h] = t;
+        } catch (e) { out.htmls[h] = ''; }
+    }
+    return out;
+}
+"""
+
+
 def _api_json(page: Page, api: str, want: str = "json"):
     """เรียก API ผ่านเบราว์เซอร์ (ลองใหม่ถ้าหน้าเพิ่งเปลี่ยนทาง)"""
     last = None
@@ -781,6 +842,7 @@ def fetch_course_units(page: Page, course_id: str) -> list[dict]:
 
     blocks = data.get("blocks") or {}
     units: list[dict] = []
+    chapters: dict[str, dict] = {}
 
     def children_of(node) -> list[dict]:
         """ลูกของ block (API อาจคืนมาเป็น id หรือเป็น dict)"""
@@ -815,19 +877,45 @@ def fetch_course_units(page: Page, course_id: str) -> list[dict]:
             or ""
         )
 
-    def walk(node, trail: list[str]) -> None:
+    def walk(node, trail: list[str], chapter: str = "", bucket: Optional[dict] = None) -> None:
         for child in children_of(node):
             btype = child.get("type", "")
             title = child.get("display_name") or btype
             kids = children_of(child)
 
-            if btype in ("course", "chapter", "sequential"):
-                walk(child, trail + ([title] if btype != "course" else []))
+            if btype == "chapter":
+                # เริ่มบทใหม่ -> เก็บรายการวิดีโอ/เอกสารของบทนี้ไว้ทำบริบทให้ AI
+                chapter = title
+                bucket = chapters.setdefault(title, {"videos": [], "html": []})
+                walk(child, [title], chapter, bucket)
                 continue
+
+            if btype in ("course", "sequential"):
+                walk(child, trail + ([title] if btype != "course" else []), chapter, bucket)
+                continue
+
+            if bucket is not None:
+                bid = child.get("id") or ""
+                if btype == "video" and bid and bid not in bucket["videos"]:
+                    bucket["videos"].append(bid)
+                elif btype == "html":
+                    hurl = unit_url(child)
+                    if hurl and hurl not in bucket["html"]:
+                        bucket["html"].append(hurl)
 
             if btype == "vertical":
                 # 1 หน้า courseware = 1 vertical (อาจมีวิดีโอ/โจทย์/เนื้อหาหลายอัน)
                 types = [k.get("type", "") for k in kids]
+                if bucket is not None:
+                    for k in kids:
+                        kt = k.get("type")
+                        bid = k.get("id") or ""
+                        if kt == "video" and bid and bid not in bucket["videos"]:
+                            bucket["videos"].append(bid)
+                        elif kt == "html":
+                            hurl = unit_url(k)
+                            if hurl and hurl not in bucket["html"]:
+                                bucket["html"].append(hurl)
                 url = unit_url(child)
                 if not url:
                     for k in kids:
@@ -850,6 +938,8 @@ def fetch_course_units(page: Page, course_id: str) -> list[dict]:
                     "url": url,
                     "done": is_done(child),
                     "path": " / ".join(trail),
+                    "chapter": chapter,
+                    "chapter_blocks": dict(bucket) if bucket else {"videos": [], "html": []},
                 }
             )
 
@@ -860,6 +950,98 @@ def fetch_course_units(page: Page, course_id: str) -> list[dict]:
         walk(data, [])
 
     return units
+
+
+def fetch_chapter_texts(
+    page: Page,
+    course_id: str,
+    chapter_blocks: dict[str, dict],
+    use_cache: bool = True,
+) -> dict[str, str]:
+    """ดึงเนื้อหาบทเรียน (คำบรรยายวิดีโอ + เอกสาร html) ของแต่ละบท มาเป็นข้อความ
+
+    ใช้เป็นบริบทให้ AI ตอบคำถามให้ตรงกับที่สอนจริง — เก็บ cache ไว้ใน lessons_cache.json
+    """
+    import json
+
+    cache_file = Path(__file__).parent / "lessons_cache.json"
+    cache: dict[str, dict] = {}
+    if use_cache and cache_file.exists():
+        try:
+            cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+
+    saved = cache.get(course_id) or {}
+    if saved:
+        missing = {k: v for k, v in chapter_blocks.items() if k not in saved}
+        if not missing:
+            print(f"📚 ใช้เนื้อหาบทเรียนที่เคยดึงไว้ ({len(saved)} บท)")
+            return saved
+
+    print(f"📚 กำลังดึงเนื้อหาบทเรียน {len(chapter_blocks)} บท (วิดีโอ + เอกสาร) ...")
+    videos: list[str] = []
+    htmls: list[str] = []
+    for blocks in chapter_blocks.values():
+        for v in blocks.get("videos") or []:
+            if v not in videos:
+                videos.append(v)
+        for h in blocks.get("html") or []:
+            if h not in htmls:
+                htmls.append(h)
+
+    try:
+        raw = page.evaluate(
+            _JS_FETCH_LESSONS,
+            {"course": course_id, "videos": videos, "htmls": htmls},
+        )
+    except Exception as e:
+        print(f"⚠️ ดึงเนื้อหาบทเรียนไม่สำเร็จ: {str(e)[:120]}")
+        return saved
+
+    vtext = (raw or {}).get("videos") or {}
+    htext = (raw or {}).get("htmls") or {}
+
+    result: dict[str, str] = {}
+    for chapter, blocks in chapter_blocks.items():
+        parts = []
+        for v in blocks.get("videos") or []:
+            t = _clean_transcript(vtext.get(v) or "")
+            if len(t) > 40:
+                parts.append(f"[วิดีโอ] {t}")
+        for h in blocks.get("html") or []:
+            t = _clean_transcript(htext.get(h) or "")
+            if len(t) > 40:
+                parts.append(f"[เอกสาร] {t}")
+        result[chapter] = "\n\n".join(parts)
+
+    got = sum(1 for t in result.values() if t)
+    print(f"   ✅ ได้เนื้อหา {got}/{len(result)} บท "
+          f"({sum(len(t) for t in result.values()):,} ตัวอักษร)")
+
+    if got:
+        cache[course_id] = result
+        try:
+            cache_file.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception:
+            pass
+
+    return result
+
+
+def _clean_transcript(text: str) -> str:
+    """ล้าง timestamp/เลขลำดับของไฟล์ transcript ให้เหลือแต่ข้อความ"""
+    if not text:
+        return ""
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.isdigit():
+            continue
+        if "-->" in s:
+            continue
+        lines.append(s)
+    return re.sub(r"[ \t]+", " ", " ".join(lines)).strip()
 
 
 def ensure_enrolled(page: Page) -> bool:
@@ -1259,9 +1441,65 @@ def _wait_submitted(page: Page, group: str, timeout: float = 25.0) -> str:
     return ""
 
 
-def solve_page_one_by_one(page: Page, profile: dict, dry_run: bool = False) -> dict:
+def _submit_problem(page: Page, group: str, timeout: float = 25.0) -> str:
+    """กด Submit ของข้อนั้น (รอ response ของ edX ด้วย) แล้วคืนผล correct/incorrect"""
+    try:
+        block = _problem_by_group(page, group)
+        btn = block.locator(
+            "button:has-text('Submit'), button:has-text('ส่งคำตอบ'), "
+            "button:has-text('ตรวจสอบ'), button.submit"
+        ).first
+        if not btn.count():
+            return ""
+        btn.scroll_into_view_if_needed(timeout=5000)
+    except Exception:
+        return ""
+
+    ok = False
+    try:
+        with page.expect_response(
+            lambda r: "handler/submit" in (r.url or ""), timeout=20000
+        ):
+            btn.click(force=True, timeout=5000)
+        ok = True
+        print("🚀 กด Submit")
+    except Exception:
+        # ไม่เห็น response — ลองกดซ้ำอีกครั้ง
+        try:
+            btn.click(force=True, timeout=5000)
+            print("🚀 กด Submit (ลองใหม่)")
+        except Exception as e:
+            print(f"⚠️ กด Submit ไม่สำเร็จ: {e}")
+            return ""
+
+    if ok:
+        time.sleep(0.8)
+    return _wait_submitted(page, group, timeout=timeout)
+
+
+def _submit_available(page: Page, group: str) -> bool:
+    """ยังมีปุ่ม Submit ให้กดไหม (ถ้าหมดจำนวนครั้ง ปุ่มจะหายไป)"""
+    try:
+        block = _problem_by_group(page, group)
+        return block.locator(
+            "button:has-text('Submit'), button:has-text('ส่งคำตอบ'), button.submit"
+        ).count() > 0
+    except Exception:
+        return False
+
+
+def solve_page_one_by_one(
+    page: Page,
+    profile: dict,
+    dry_run: bool = False,
+    context: str = "",
+    chapter: str = "",
+    retry_wrong: bool = True,
+) -> dict:
     """ตอบ + กด Submit ทีละข้อ (แบบ Open edX ที่แต่ละข้อมีปุ่มของตัวเอง)
 
+    context    = เนื้อหาบทเรียน (ใช้เป็นบริบทให้ AI ตอบตรงกับที่สอน)
+    retry_wrong = ถ้าตอบผิด ให้ลองตัวเลือกที่เหลือให้อัตโนมัติ (จนกว่าจะถูกหรือหมดสิทธิ์)
     คืนค่า {"answered": n, "correct": n, "incorrect": n, "skipped": n}
     """
     done: set[str] = set()
@@ -1285,7 +1523,7 @@ def solve_page_one_by_one(page: Page, profile: dict, dry_run: bool = False) -> d
         if idx is not None:
             print(f"🎯 หน้าเว็บเฉลยไว้แล้ว: '{q.options[idx]}'")
         else:
-            ai_answer = get_answer_from_ai(q.text, q.options)
+            ai_answer = get_answer_from_ai(q.text, q.options, context=context, chapter=chapter)
             print(f"💡 AI ตอบกลับมาว่า: '{ai_answer}'")
             idx = match_answer_to_index(ai_answer, q.options)
 
@@ -1306,26 +1544,31 @@ def solve_page_one_by_one(page: Page, profile: dict, dry_run: bool = False) -> d
         print(f"✅ เลือก: '{q.options[idx]}'")
 
         # ---- กด Submit ของข้อนี้ ----
-        try:
-            block = _problem_by_group(page, q.name)
-            btn = block.locator(
-                "button:has-text('Submit'), button:has-text('ส่งคำตอบ'), "
-                "button:has-text('ตรวจสอบ'), button.submit"
-            ).first
-            btn.scroll_into_view_if_needed(timeout=5000)
-            btn.click(force=True, timeout=5000)
-            print("🚀 กด Submit")
-        except Exception as e:
-            print(f"⚠️ กด Submit ไม่สำเร็จ: {e}")
-            continue
-
-        result = _wait_submitted(page, q.name)
+        result = _submit_problem(page, q.name)
         if result == "correct":
             correct += 1
             print("🟢 ถูกต้อง")
         elif result == "incorrect":
             incorrect += 1
             print("🔴 ผิด")
+            if retry_wrong:
+                # บางข้อเฉลยของวิชาไม่ตรงกับที่ AI/เนื้อหาบอก -> ลองตัวเลือกที่เหลือ
+                for alt in range(len(q.options)):
+                    if alt == idx:
+                        continue
+                    if not _submit_available(page, q.name):
+                        print("   ℹ️ ไม่มีปุ่ม Submit เหลือ — หยุดลองตัวเลือกอื่น")
+                        break
+                    print(f"   🔁 ลองตัวเลือกอื่น: '{q.options[alt]}'")
+                    if not click_option(page, q, alt, profile.get("option_css")):
+                        continue
+                    r2 = _submit_problem(page, q.name)
+                    if r2 == "correct":
+                        correct += 1
+                        incorrect -= 1
+                        print("   🟢 ถูกต้องในที่สุด")
+                        break
+                    print(f"   🔴 ยังผิด ({r2 or 'ไม่ทราบผล'})")
         else:
             print("⏳ ไม่เห็นผลตรวจ (อาจต้องกดเองในเบราว์เซอร์)")
 

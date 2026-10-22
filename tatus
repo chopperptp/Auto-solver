@@ -1,0 +1,10 @@
+warning: in the working copy of '.gitignore', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/.gitignore b/.gitignore[m
+[1mindex f7d633a..86c545b 100644[m
+[1m--- a/.gitignore[m
+[1m+++ b/.gitignore[m
+[36m@@ -3,3 +3,4 @@[m [mbrowser_profile/[m
+ __pycache__/[m
+ .vscode/[m
+ run_log*.txt[m
+[32m+[m[32mlessons_cache.json[m
