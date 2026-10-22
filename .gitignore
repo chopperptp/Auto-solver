@@ -1,0 +1,5 @@
+﻿.env
+browser_profile/
+__pycache__/
+.vscode/
+run_log*.txt
