@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <title>ตัวอย่างฟีเจอร์ของ Marketing Automation - SET e-Learning</title>
+</head>
+<body>
+  <input type="hidden" id="duration">
+  <div id="player"><video autoplay playsinline></video></div>
+  <script>
+    var topics_state = 'vod';
+    var topics_type = 'regular';
+    var enroll2topic_id = '143478875';
+    var enroll_topics_id = '7945';
+
+    function veCompleteTopic() {
+      $.post('/api/site/enroll2topic_status', {'id' : '143478875', 'status': '1'}, function(data) {
+        if (data.message.auto_quiz) {
+          window.location.href = '/SETGroup/enroll/26739471/exam/' + data.message.qid + '/quiz';
+        } else if (data.chk == 'next') {
+          $.post('/api/site/enroll2topic_stage', {'enroll' : 26739471, 'topics': data.topics.next.id}, function() {
+            window.location.href = '/SETGroup/enroll/26739471/course';
+          });
+        } else if (data.chk == 'examination') {
+          window.location.href = '/SETGroup/enroll/26739471/exam/exam';
+        }
+      });
+    }
+  </script>
+</body>
+</html>

@@ -6,6 +6,7 @@ run_log*.txt
 lessons_cache.json
 _set_dumps/
 _set_banks/
+_set_state.json
 _probe_out/
 _set_run*.log
 _fake_exam.html

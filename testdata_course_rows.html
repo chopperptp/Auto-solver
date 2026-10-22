@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="th">
+<head><meta charset="utf-8"><title>course rows fixture</title></head>
+<body>
+<div class="timeline-block">
+  <div class="timeline-main-topic"><div>Introduction</div><div>1 หัวข้อเรียน</div></div>
+
+  <!-- done: บทแรกของคอร์ส -->
+  <div class="timeline-sub-topic-block done">
+    <div class="d-flex align-items-stretch position-relative">
+      <div class="timeline-icon-block py-2">
+        <div class="timeline-line"><div class="timeline-line-progress" style="height: 100%;"></div></div>
+        <div class="timeline-icon" data-original-title="100%"><i class="fas fa-video"></i></div>
+      </div>
+      <div class="flex-fill ml-2 py-2">
+        <a href="/SETGroup/enroll/1/topics/1" class="timeline-sub-topic">
+          <div>แนะนำหลักสูตร</div><div>00:01:32</div>
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <div class="timeline-main-topic"><div>Module 1</div><div>1 หัวข้อเรียน</div></div>
+
+  <!-- done แบบไม่มี progress bar -->
+  <div class="timeline-sub-topic-block done ">
+    <div class="d-flex align-items-stretch position-relative">
+      <div class="timeline-icon-block py-2">
+        <div class="timeline-line"><div class="timeline-line-progress" style="height: 100%;"></div></div>
+        <div class="timeline-icon" data-original-title="100%"><i class="fas fa-check"></i></div>
+      </div>
+      <div class="flex-fill ml-2 py-2">
+        <a href="/SETGroup/enroll/1/topics/2" class="timeline-sub-topic">
+          <div>บทที่ผ่านแล้ว</div><div>00:10:00</div>
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- ยังไม่ผ่าน 40% จาก title ของ icon -->
+  <div class="timeline-sub-topic-block ">
+    <div class="d-flex align-items-stretch position-relative">
+      <div class="timeline-icon-block py-2">
+        <div class="timeline-line"><div class="timeline-line-progress" style="height: 40%;"></div></div>
+        <div class="timeline-icon" data-original-title="40%"><i class="fas fa-video"></i></div>
+      </div>
+      <div class="flex-fill ml-2 py-2">
+        <a href="/SETGroup/enroll/1/topics/3" class="timeline-sub-topic">
+          <div>บทที่ยังไม่ผ่าน</div><div>00:10:00</div>
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- active 40%: ลิงก์ javascript:void(0); และมีแต่ style height -->
+  <div class="timeline-sub-topic-block active">
+    <div class="d-flex align-items-stretch position-relative">
+      <div class="timeline-icon-block py-2">
+        <div class="timeline-line"><div class="timeline-line-progress" style="height: 40%;"></div></div>
+        <div class="timeline-icon">
+          <div class="timeline-line-progress" style="height: 40%;"></div>
+          <i class="fas fa-video"></i>
+        </div>
+      </div>
+      <div class="flex-fill ml-2 py-2">
+        <a href="javascript:void(0);" class="timeline-sub-topic">
+          <div>บทปัจจุบัน 40%</div><div>00:10:00</div>
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>var topics_id = '4';</script>
+</body>
+</html>

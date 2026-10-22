@@ -43,6 +43,7 @@ HERE = Path(__file__).parent
 LINKS_FILE = HERE / "set_links.txt"
 PROFILE_DIR = HERE / "browser_profile"
 DUMP_DIR = HERE / "_set_dumps"
+STATE_FILE = HERE / "_set_state.json"
 
 BASE = "https://elearning.set.or.th"
 GROUP = "SETGroup"
@@ -312,6 +313,79 @@ def build_quiz_bank(course: dict) -> list[dict]:
     return quizzes
 
 
+def course_plan(course: dict) -> list[dict]:
+    """วิเคราะห์ว่าแต่ละหมวดเป็น "เรียนล้วน" หรือ "เรียน + มีแบบทดสอบ"
+
+    SET เก็บ quiz ที่ผูกกับหมวดไว้ใน main_topics[].quiz_id (บางคอร์สมี auto_quiz)
+    ถ้า quiz_id ตรงกับ pre/post/exam/survey ที่มีเฉลยอยู่แล้ว จะรู้ชนิดได้ทันที
+    """
+    quiz_kind_by_id = {}
+    for key, short in QUIZ_KINDS.items():
+        qz = course.get(key)
+        if isinstance(qz, dict) and qz.get("id"):
+            quiz_kind_by_id[str(qz["id"])] = short
+
+    plan = []
+    for main in course.get("main_topics") or []:
+        topics = [s for s in (main.get("sub_topics") or []) if s.get("id")]
+        if not topics:
+            continue
+        quiz_id = str(main.get("quiz_id") or "")
+        auto_quiz = bool(main.get("auto_quiz"))
+        plan.append({
+            "id": str(main.get("id") or ""),
+            "title": plain_text(main.get("title", "")),
+            "topics": topics,
+            "quiz_id": quiz_id,
+            "quiz_kind": quiz_kind_by_id.get(quiz_id, "quiz" if quiz_id else ""),
+            "auto_quiz": auto_quiz,
+            "has_quiz": bool(quiz_id or auto_quiz),
+            "known_quiz": bool(quiz_id and quiz_id in quiz_kind_by_id),
+        })
+    return plan
+
+
+def describe_course_plan(course: dict, plan: list[dict], quizzes: list[dict]) -> None:
+    """พิมพ์แผนให้เห็นชัดว่าอะไรเรียนล้วน อะไรมีข้อสอบ และจะทำชุดไหน"""
+    topic_count = sum(len(p["topics"]) for p in plan)
+    with_quiz = [p for p in plan if p["has_quiz"]]
+    learn_only = [p for p in plan if not p["has_quiz"]]
+
+    print(f"\n   📋 แผนการเรียน: {len(plan)} หมวด / {topic_count} บท")
+    if not topic_count:
+        print("      • ไม่มีบทเรียนในคอร์สนี้")
+
+    if topic_count and not with_quiz:
+        print("      • บทเรียน: เรียนอย่างเดียว (ไม่มีคำถามแยกในบท)")
+    else:
+        if learn_only:
+            print(f"      • เรียนอย่างเดียว: {len(learn_only)} หมวด")
+        for p in with_quiz:
+            if p["known_quiz"]:
+                print(f"      • เรียน + ข้อสอบ: {p['title']} -> [{p['quiz_kind']}]")
+            elif p["auto_quiz"]:
+                print(
+                    f"      • เรียน + ข้อสอบอัตโนมัติ: {p['title']} "
+                    "(จะทำเมื่อเว็บปลดล็อกและมีเฉลย)"
+                )
+            else:
+                print(
+                    f"      • เรียน + ข้อสอบ id={p['quiz_id']}: {p['title']} "
+                    "(ยังไม่มีเฉลย — จะไม่เริ่มเพื่อกันเสียสิทธิ์)"
+                )
+
+    if not quizzes:
+        print("      • แบบทดสอบ: ไม่มี — เรียนจบเป็นอันเสร็จ")
+        return
+
+    labels = ", ".join(
+        f"{q['kind']} {len(q['questions'])} ข้อ" for q in quizzes
+    )
+    print(f"      • แบบทดสอบ: {labels}")
+    if topic_count and not with_quiz:
+        print("      • รูปแบบ: เรียนเนื้อหาให้ครบ แล้วทำแบบทดสอบของคอร์สตามลำดับ")
+
+
 # ============================================================================
 # 2. ล็อกอิน / ลงทะเบียน
 # ============================================================================
@@ -368,11 +442,35 @@ def settle(page: Page, url: str, timeout: int = 45000) -> bool:
     return False
 
 
+def restore_session(ctx) -> None:
+    """คืนคุกกี้ที่บันทึกไว้ (cookie session ของ SET มักไม่ถูกเก็บลง browser_profile)"""
+    if not STATE_FILE.exists():
+        return
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        cookies = state.get("cookies") or []
+        if cookies:
+            ctx.add_cookies(cookies)
+    except Exception:
+        pass
+
+
+def save_session(ctx) -> None:
+    try:
+        state = ctx.storage_state()
+        STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
 def wait_for_login(ctx, page: Page, course_url: str) -> bool:
     """เปิดหน้าเว็บแล้วรอจนผู้ใช้ล็อกอิน (ล็อกอินเองในหน้าต่างเบราว์เซอร์)"""
     goto(page, course_url)
     if is_logged_in(page):
         print("✅ ล็อกอินอยู่แล้ว (ใช้ session เดิมจาก browser_profile)\n")
+        save_session(ctx)
         return True
 
     print("🔐 ยังไม่ล็อกอิน — กำลังพาไปหน้าเข้าสู่ระบบ SET Member ...")
@@ -394,32 +492,25 @@ def wait_for_login(ctx, page: Page, course_url: str) -> bool:
     print("   • session ถูกจำไว้ใน browser_profile — ครั้งเดียวก็พอ")
     print("=" * 62)
 
-    probe = ctx.new_page()
     ok = False
-    try:
-        for i in range(240):  # 240 * 5s = 20 นาที
-            time.sleep(5)
-            if i % 6 == 0:
-                print(f"   ... รอล็อกอิน ({i * 5}s)")
-            try:
-                probe.goto(course_url, wait_until="domcontentloaded", timeout=60000)
-                probe.wait_for_timeout(500)
-                if is_logged_in(probe):
-                    ok = True
-                    break
-            except Exception:
-                continue
-    finally:
+    for i in range(240):  # 240 * 5s = 20 นาที
+        time.sleep(5)
+        if i % 6 == 0:
+            print(f"   ... รอล็อกอิน ({i * 5}s)")
         try:
-            probe.close()
+            # ตรวจหน้าล็อกอินเดิมโดยไม่เปิดแท็บใหม่ทับ (ผู้ใช้จะเห็นฟอร์มล็อกอินตลอด)
+            if is_logged_in(page):
+                ok = True
+                break
         except Exception:
-            pass
+            continue
 
     if not ok:
         raise SystemExit("❌ ล็อกอินไม่สำเร็จภายในเวลาที่กำหนด — ลองรันใหม่")
 
     print("✅ ล็อกอินเรียบร้อย เริ่มทำงานต่อได้เลย\n")
     goto(page, course_url)
+    save_session(ctx)
     return True
 
 
@@ -844,8 +935,85 @@ VERIFY_ANSWERS_JS = r"""
 }
 """
 
+EXAM_HISTORY_JS = r"""
+() => {
+  const rows = [...document.querySelectorAll('.table-history tbody tr')];
+  return rows.map((tr) => {
+    const cells = [...tr.querySelectorAll('td')].map(
+      (td) => (td.innerText || '').trim()
+    );
+    return {
+      cells,
+      text: (tr.innerText || '').trim(),
+      success: !!tr.querySelector('td.text-success'),
+    };
+  }).filter((r) => r.text);
+}
+"""
 
-TOPIC_STATUS_RE = re.compile(r"enroll2topic_status',\s*\{'id'\s*:\s*'?(\d+)")
+
+def exam_history_passed(rows: list[dict]) -> bool:
+    """ประวัติการสอบมีแถวที่ "ผ่าน" แล้วหรือยัง (แยกจาก "ไม่ผ่าน")"""
+    for row in rows or []:
+        cells = [str(c).strip() for c in (row.get("cells") or [])]
+        status = cells[-1] if cells else str(row.get("text") or "").strip()
+        if row.get("success"):
+            return True
+        if "ผ่าน" in status and "ไม่ผ่าน" not in status:
+            return True
+    return False
+
+
+def exam_history_summary(rows: list[dict]) -> str:
+    """สรุปประวัติแบบสั้น ๆ เช่น 2 ครั้ง, ล่าสุด 10/10 (ผ่าน)"""
+    if not rows:
+        return "ยังไม่มีประวัติ"
+    latest = rows[0]
+    cells = [str(c).strip() for c in (latest.get("cells") or [])]
+    if len(cells) >= 4:
+        return f"{len(rows)} ครั้ง, ล่าสุด {cells[-2]} ({cells[-1]})"
+    if cells:
+        return f"{len(rows)} ครั้ง, ล่าสุด {cells[-1]}"
+    return f"{len(rows)} ครั้ง"
+
+
+def read_exam_history(page: Page, timeout_ms: int = 5000) -> list[dict]:
+    """รอให้ตารางประวัติสอบโหลดผ่าน AJAX แล้วคืนแถวทั้งหมด"""
+    try:
+        if page.locator(".table-history").count() == 0:
+            return []
+    except Exception:
+        return []
+
+    deadline = time.time() + max(1, timeout_ms) / 1000
+    rows: list[dict] = []
+    while time.time() < deadline:
+        try:
+            rows = page.evaluate(EXAM_HISTORY_JS) or []
+        except Exception:
+            rows = []
+        if rows:
+            return rows
+        page.wait_for_timeout(400)
+    return rows
+
+
+TOPIC_STATUS_PATTERNS = (
+    re.compile(r"enroll2topic_status['\"]?\s*[,:]\s*\{?\s*['\"]?id['\"]?\s*[:=]\s*['\"]?(\d+)", re.I),
+    re.compile(r"enroll2topic_status[^\n]{0,200}?['\"]?id['\"]?\s*[:=]\s*['\"]?(\d+)", re.I),
+    re.compile(r"enroll2topic_id['\"]?\s*[:=]\s*['\"]?(\d+)", re.I),
+    re.compile(r"data-enroll2topic(?:-id)?=['\"](\d+)", re.I),
+    re.compile(r"enroll2topic['\"]?\s*[:=]\s*\{[^}]{0,300}?['\"]?id['\"]?\s*[:=]\s*['\"]?(\d+)", re.I),
+    re.compile(r"enroll2topic[^\n]{0,120}?['\"]?id['\"]?\s*[:=]\s*['\"]?(\d+)", re.I),
+)
+
+
+def find_enroll2topic_id(html: str) -> Optional[str]:
+    for pat in TOPIC_STATUS_PATTERNS:
+        m = pat.search(html or "")
+        if m:
+            return m.group(1)
+    return None
 
 TOPIC_COMPLETE_JS = r"""
 async ({id, duration}) => {
@@ -872,6 +1040,110 @@ async ({id, duration}) => {
 """
 
 
+COURSE_TOPIC_ROWS_JS = r"""
+() => {
+  const out = [];
+  const seen = new Set();
+
+  const progressOf = (block) => {
+    if (!block) return 0;
+    if (block.classList.contains('done')) return 100;
+    const icon = block.querySelector('.timeline-icon');
+    for (const el of [icon, block]) {
+      if (!el) continue;
+      const t = (el.getAttribute('data-original-title') || el.getAttribute('title') || '').trim();
+      const m = t.match(/(\d+(?:\.\d+)?)\s*%/);
+      if (m) return Math.round(parseFloat(m[1]));
+    }
+    // ใช้เฉพาะ progress bar ใต้ icon ไม่ใช่เส้นแนวตั้งของ timeline
+    const bar = block.querySelector('.timeline-icon .timeline-line-progress');
+    const h = (bar && bar.getAttribute('style')) || '';
+    const m = h.match(/height\s*:\s*(\d+(?:\.\d+)?)%/);
+    if (m) return Math.round(parseFloat(m[1]));
+    return 0;
+  };
+
+  const currentTid = String(window.topics_id || '');
+  for (const a of document.querySelectorAll('a.timeline-sub-topic, a[href*="/topics/"]')) {
+    const href = a.getAttribute('href') || '';
+    const m = href.match(/\/topics\/(\d+)/);
+    const block = a.closest('.timeline-sub-topic-block');
+    // บทที่กำลังเปิดอยู่ใช้ href="javascript:void(0);" จึงต้องอ่านจาก topics_id
+    let tid = m ? m[1] : '';
+    if (!tid && block && block.classList.contains('active') && currentTid) {
+      tid = currentTid;
+    }
+    if (!tid) continue;
+    if (seen.has(tid)) continue;
+    seen.add(tid);
+    const row = a.closest('.d-flex.align-items-start') || a.closest('tr') || a.parentElement;
+    out.push({
+      tid,
+      title: (a.innerText || '').trim(),
+      href,
+      cls: [a.className || '', block ? block.className : ''].join(' ').trim(),
+      progress: progressOf(block),
+      has_row: !!row,
+      html: row ? row.outerHTML.slice(0, 16000) : '',
+    });
+  }
+  return out;
+}
+"""
+
+
+STAGE_TOPIC_JS = r"""
+async ({eid, tid}) => {
+  const r = await fetch('/api/site/enroll2topic_stage', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'X-Requested-With': 'XMLHttpRequest',
+      'Accept': 'application/json',
+    },
+    body: new URLSearchParams({enroll: eid, topics: tid}).toString(),
+  });
+  const text = await r.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) {}
+  return {status: r.status, json};
+}
+"""
+
+
+TOPIC_WATCH_JS = r"""
+async () => {
+  const v = document.querySelector('video');
+  if (!v) return {ok: false, reason: 'no-video'};
+  const meta = await new Promise((resolve) => {
+    if (isFinite(v.duration) && v.duration > 0) return resolve(true);
+    const done = () => resolve(isFinite(v.duration) && v.duration > 0);
+    v.addEventListener('loadedmetadata', done, {once: true});
+    setTimeout(() => resolve(isFinite(v.duration) && v.duration > 0), 8000);
+  });
+  if (!meta) return {ok: false, reason: 'no-metadata'};
+  const duration = v.duration;
+  try { v.muted = true; } catch (e) {}
+  try { v.playbackRate = 16; } catch (e) {}
+  const inp = document.querySelector('#duration');
+  if (inp) inp.value = String(Math.floor(duration));
+  try { await v.play(); } catch (e) {}
+  await new Promise((r) => setTimeout(r, 700));
+  const target = Math.max(0, duration - 1);
+  try { v.currentTime = target; } catch (e) {}
+  try {
+    if (window.playerInstanceVe && playerInstanceVe.player) {
+      const p = playerInstanceVe.player;
+      if (p.setPlaybackRate) p.setPlaybackRate(16);
+      if (p.seek) p.seek(target);
+      if (p.play) p.play();
+    }
+  } catch (e) {}
+  return {ok: true, duration, current: v.currentTime, rate: v.playbackRate};
+}
+"""
+
+
 def parse_duration_seconds(text: str) -> int:
     """'00:23:55' -> 1435"""
     try:
@@ -892,53 +1164,389 @@ def flat_topics(course: dict) -> list[dict]:
     return out
 
 
-def complete_topics(page: Page, course: dict, eid: int) -> bool:
-    """ทำเครื่องหมายทุกบทเรียนว่าจบผ่าน API (ไม่ต้องดูวิดีโอ) เพื่อปลดล็อก post-test/exam"""
+def topic_rows_from_payload(rows: list[dict]) -> dict[str, dict]:
+    """แปลงข้อมูลแถวจาก COURSE_TOPIC_ROWS_JS -> {tid: progress/unlocked}"""
+    out: dict[str, dict] = {}
+    for r in rows or []:
+        tid = str(r.get("tid") or "")
+        if not tid:
+            continue
+        cls = r.get("cls") or ""
+        if "progress" in r:
+            # หน้าเว็บรุ่นใหม่: JS อ่าน class done / title % ให้แล้ว
+            progress = int(r.get("progress") or 0)
+            if "done" in cls.split():
+                progress = 100
+        else:
+            # ข้อมูลรุ่นเก่า: อ่านจาก progress bar width ใน HTML
+            widths = [
+                int(float(x))
+                for x in re.findall(r"width\s*:\s*(\d+(?:\.\d+)?)%", r.get("html") or "")
+            ]
+            progress = max(widths) if widths else 0
+        item = {
+            "tid": tid,
+            "title": (r.get("title") or "").strip(),
+            "href": r.get("href") or "",
+            # ไม่เห็น has-access แต่มีลิงก์/สถานะ done = เปิดเรียนได้แล้ว
+            "unlocked": (
+                "has-access" in cls or "done" in cls.split() or bool(r.get("href"))
+            ),
+            "progress": progress,
+        }
+        old = out.get(tid)
+        if old is None:
+            out[tid] = item
+            continue
+        # รวมข้อมูลจากแถวซ้ำ: เปิดได้ถ้ามีอันไหนเปิดได้, ใช้ progress สูงสุด
+        old["unlocked"] = old["unlocked"] or item["unlocked"]
+        old["progress"] = max(old["progress"], item["progress"])
+        if not old["title"] and item["title"]:
+            old["title"] = item["title"]
+        if not old["href"] and item["href"]:
+            old["href"] = item["href"]
+    return out
+
+
+def parse_course_topic_rows(page: Page, eid: int) -> dict[str, dict]:
+    """อ่านแถวบทเรียนจากหน้าคอร์ส: progress=100 คือผ่านแล้ว, unlocked=has-access"""
+    url = f"{BASE}/{GROUP}/enroll/{eid}/course"
+    try:
+        if not settle(page, url):
+            return {}
+        page.wait_for_timeout(1200)
+        rows = page.evaluate(COURSE_TOPIC_ROWS_JS) or []
+    except Exception:
+        return {}
+    return topic_rows_from_payload(rows)
+
+
+def stage_topic(page: Page, eid: int, tid: str) -> bool:
+    """เลื่อนตำแหน่งเรียนไปบทถัดไป (ทำให้บทถัดไปถูกปลดล็อก)"""
+    try:
+        res = page.evaluate(STAGE_TOPIC_JS, {"eid": eid, "tid": str(tid)})
+    except Exception as e:
+        print(f"      ⚠️ เรียก stage ไม่สำเร็จ: {type(e).__name__}")
+        return False
+    st = (res or {}).get("status")
+    if st and int(st) < 400:
+        return True
+    print(f"      ⚠️ stage ตอบ HTTP {st}")
+    return False
+
+
+def is_topic_page(page: Page, tid: str) -> bool:
+    """อยู่หน้าบทเรียนจริง ไม่ใช่หน้าคอร์สที่เด้งกลับมา"""
+    try:
+        u = page.url or ""
+        if f"/topics/{tid}" not in u:
+            return False
+        title = page.title() or ""
+        if "รายละเอียดหลักสูตร" in title:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def open_topic(page: Page, eid: int, tid: str) -> bool:
+    """เปิดบทเรียน; ถ้าเด้งกลับหน้าคอร์ส ให้กดลิงก์เข้าเรียนจากหน้าคอร์ส"""
+    url = f"{BASE}/{GROUP}/enroll/{eid}/topics/{tid}"
+    for attempt in range(2):
+        if settle(page, url):
+            page.wait_for_timeout(1400)
+            if is_topic_page(page, tid):
+                return True
+            if "member.set.or.th" in (page.url or ""):
+                return False
+
+        # เด้งกลับ -> เปิดหน้าคอร์สแล้วกด "เข้าเรียน" ของบทนี้
+        try:
+            settle(page, f"{BASE}/{GROUP}/enroll/{eid}/course")
+            page.wait_for_timeout(900)
+            link = page.locator(f'a[href*="/topics/{tid}"]')
+            if link.count() > 0:
+                link.first.click(timeout=8000)
+                page.wait_for_timeout(2600)
+                if is_topic_page(page, tid):
+                    return True
+        except Exception:
+            pass
+
+        # เผื่อรอบแรกโดน redirect ชั่วคราว
+        page.wait_for_timeout(800)
+
+    return is_topic_page(page, tid)
+
+
+def _topic_nav_action(page: Page, tid: str) -> str:
+    """ดูว่าเว็บพาไปหน้าไหนหลังบันทึกผลบทเรียน"""
+    u = page.url or ""
+    if "/exam/" in u:
+        return "quiz"
+    if "/summary" in u:
+        return "done"
+    if "/topics/" in u and f"/topics/{tid}" not in u:
+        return "next"
+    if "/course" in u and "/topics/" not in u:
+        return "next"
+    return ""
+
+
+def _topic_status_action(page: Page, eid: int, data: dict) -> str:
+    """แปลง chk จาก API เป็นการกระทำของบอท"""
+    chk = data.get("chk") if isinstance(data, dict) else None
+    next_id = ""
+    try:
+        next_id = str((data.get("topics") or {}).get("next", {}).get("id") or "")
+    except Exception:
+        next_id = ""
+
+    # player ของเว็บจะพาไปทำ quiz ทันทีถ้า auto_quiz
+    if isinstance(data.get("message"), dict) and data["message"].get("auto_quiz"):
+        return "quiz"
+
+    if chk in ("next", "success_next", "success", "survey"):
+        if next_id:
+            stage_topic(page, eid, next_id)
+        return "next"
+    if chk in ("quiz", "examination", "post-test"):
+        return "quiz"
+    if chk == "return":
+        return "next"
+    return ""
+
+
+def watch_and_complete_topic(page: Page, eid: int, topic: dict, e2t: str) -> str:
+    """เล่นวิดีโอไปท้ายบท -> รอ dialog ของเว็บ -> กดยืนยัน -> stage บทถัดไป"""
+    title = plain_text(topic.get("title", ""))[:52]
+    seconds = parse_duration_seconds(topic.get("duration"))
+    print(f"      ▶️ [{title}] เปิดวิดีโอและเลื่อนไปท้ายบท ...")
+    try:
+        info = page.evaluate(TOPIC_WATCH_JS) or {}
+    except Exception as e:
+        info = {"ok": False, "reason": type(e).__name__}
+
+    if info.get("ok"):
+        dur = float(info.get("duration") or 0)
+        if seconds <= 0 and dur > 0:
+            seconds = int(dur)
+        print(f"      🎬 วิดีโอพร้อม ({dur:.0f}s, เร่ง {info.get('rate')}x)")
+    else:
+        print(f"      ℹ️ เล่นวิดีโอไม่ได้ ({info.get('reason')}) — ใช้ API ทำเครื่องหมายเรียนจบ")
+
+    # ปล่อยให้ player ของเว็บยิง enroll2topic_status แล้วขึ้น dialog ยืนยัน
+    dialog = False
+    for _ in range(30):  # ~12 วินาที
+        try:
+            if page.locator(
+                ".jconfirm .btn-confirm:visible, .jconfirm-buttons .btn-confirm:visible, "
+                ".jconfirm button.btn-confirm:visible"
+            ).count() > 0:
+                dialog = True
+                break
+            nav = _topic_nav_action(page, str(topic.get("id") or ""))
+            if nav:
+                return nav
+        except Exception:
+            pass
+        page.wait_for_timeout(400)
+
+    if dialog:
+        try:
+            dtitle = page.locator(".jconfirm .jconfirm-title").first.inner_text(timeout=1000).strip()
+            btn = page.locator(".jconfirm .btn-confirm").first.inner_text(timeout=1000).strip()
+            if dtitle or btn:
+                print(f"      💬 {dtitle[:60]} → กด '{btn[:30]}'")
+        except Exception:
+            pass
+        try:
+            page.locator(".jconfirm .btn-confirm").first.click(timeout=5000)
+        except Exception as e:
+            print(f"      ⚠️ กดปุ่มยืนยันไม่สำเร็จ: {type(e).__name__}")
+
+        for _ in range(30):  # ~12 วินาที รอเว็บพาไปหน้าถัดไป
+            nav = _topic_nav_action(page, str(topic.get("id") or ""))
+            if nav:
+                return nav
+            page.wait_for_timeout(400)
+
+    # สำรอง: เรียก API เดียวกับที่ player เรียก แล้วจัดการ chk/stage เอง
+    if not e2t:
+        try:
+            e2t = find_enroll2topic_id(page.content())
+        except Exception:
+            e2t = None
+    if not e2t:
+        return "failed"
+
+    if seconds <= 0:
+        try:
+            seconds = int(
+                page.evaluate(
+                    "() => { const v = document.querySelector('video'); "
+                    "return v && isFinite(v.duration) ? v.duration : 0; }"
+                )
+                or 0
+            )
+        except Exception:
+            seconds = 0
+
+    try:
+        res = page.evaluate(TOPIC_COMPLETE_JS, {"id": e2t, "duration": seconds})
+    except Exception as e:
+        print(f"      ⚠️ เรียก API ทำเครื่องหมายไม่สำเร็จ: {type(e).__name__}")
+        return "failed"
+
+    st = (res or {}).get("status") or {}
+    data = st.get("json") or {}
+    chk = data.get("chk") if isinstance(data, dict) else None
+    print(f"      🔁 API: HTTP {st.get('status')} / {chk or '-'}")
+    action = _topic_status_action(page, eid, data)
+    if action:
+        return action
+    if st.get("status") == 200:
+        return "next"
+    return "failed"
+
+
+def learn_one_topic(page: Page, eid: int, topic: dict, args=None, attempts: int = 3) -> str:
+    """เรียนบทเดียว -> 'done' (100%), 'quiz' (เว็บปลดล็อกข้อสอบ), 'failed'"""
+    tid = str(topic["id"])
+    title = plain_text(topic.get("title", ""))[:52]
+
+    rows = parse_course_topic_rows(page, eid)
+    row = rows.get(tid)
+    if row and row.get("progress", 0) >= 100:
+        print(f"   ⏭️ {title} — ผ่านแล้ว (ข้าม)")
+        return "done"
+
+    if not row or not row.get("unlocked"):
+        print(f"   🔓 ปลดล็อก {title} ...")
+        stage_topic(page, eid, tid)
+        page.wait_for_timeout(1200)
+        rows = parse_course_topic_rows(page, eid)
+        row = rows.get(tid)
+
+    for attempt in range(1, attempts + 1):
+        if not open_topic(page, eid, tid):
+            print(
+                f"      ↪️ เปิดบทเรียนไม่ได้ (ครั้งที่ {attempt}/{attempts}) "
+                "— ลองกดเข้าเรียนจากหน้าคอร์ส/ปลดล็อกอีกครั้ง"
+            )
+            stage_topic(page, eid, tid)
+            page.wait_for_timeout(1200)
+            continue
+
+        # รอ player โหลด แล้วหา enroll2topic id
+        e2t = None
+        for _ in range(3):
+            page.wait_for_timeout(1500)
+            try:
+                e2t = find_enroll2topic_id(page.content())
+            except Exception:
+                e2t = None
+            if e2t:
+                break
+        if not e2t:
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(2000)
+                e2t = find_enroll2topic_id(page.content())
+            except Exception:
+                pass
+        if not e2t:
+            print(f"      ❌ ยังหา enroll2topic id ไม่เจอ (url: {page.url})")
+            if args is not None and getattr(args, "dump", False):
+                dump_page(page, f"topic_{tid}_no_id")
+            stage_topic(page, eid, tid)
+            page.wait_for_timeout(1200)
+            continue
+
+        action = watch_and_complete_topic(page, eid, topic, e2t)
+        if action == "quiz":
+            return "quiz"
+        if action == "done":
+            return "done"
+
+        # ตรวจจากหน้าคอร์สว่าบทนี้ขึ้น 100% หรือยัง
+        page.wait_for_timeout(800)
+        rows = parse_course_topic_rows(page, eid)
+        row = rows.get(tid)
+        if row and row.get("progress", 0) >= 100:
+            print(f"   ✅ {title} — 100%")
+            return "done"
+
+        print(
+            f"      🔄 ยังไม่ผ่าน "
+            f"(progress={row.get('progress') if row else '?'}) — ลองใหม่"
+        )
+        if attempt < attempts:
+            stage_topic(page, eid, tid)
+            page.wait_for_timeout(1000)
+
+    return "failed"
+
+
+def complete_topics(page: Page, course: dict, eid: int, args=None) -> bool:
+    """เรียนทีละบทจนครบ: ข้ามบทที่ 100% แล้ว, บทที่ยังไม่ผ่านเล่นวิดีโอ/ทำซ้ำจนผ่าน"""
     topics = flat_topics(course)
     if not topics:
         return True
 
-    print(f"\n🎬 ทำเครื่องหมายบทเรียนว่าจบ {len(topics)} บท (ไม่ต้องดูวิดีโอ)")
-    ok = 0
+    total = len(topics)
+    print(f"\n🎬 เรียนให้จบทีละบท {total} บท (ข้ามบทที่ผ่านแล้ว)")
+    quiz_unlocked = False
+
+    # ถ้าผ่านครบแล้ว ไม่ต้องเปิดบทเรียนซ้ำเลย (ประหยัดเวลา)
+    rows = parse_course_topic_rows(page, eid)
+    passed = [
+        str(t["id"]) for t in topics
+        if rows.get(str(t["id"]), {}).get("progress", 0) >= 100
+    ]
+    if len(passed) >= total:
+        print(f"   ✅ บทเรียนผ่านครบ {total}/{total} แล้ว — ไม่ต้องเรียนซ้ำ")
+        return True
+    if passed:
+        print(f"   ⏭️ ผ่านแล้ว {len(passed)}/{total} บท — จะทำเฉพาะบทที่ยังไม่ผ่าน")
+
+    # รอบแรก: ไล่ทีละบท
     for i, topic in enumerate(topics, 1):
-        tid = str(topic["id"])
-        title = plain_text(topic.get("title", ""))[:52]
-        url = f"{BASE}/{GROUP}/enroll/{eid}/topics/{tid}"
-        if not settle(page, url):
-            if "member.set.or.th" in (page.url or ""):
-                print("   ❌ หลุดล็อกอิน — หยุดทำบทเรียน")
-                return False
-            print(f"   ❌ [{i}/{len(topics)}] {title} — เปิดหน้าไม่ได้")
-            continue
+        print(f"\n   [{i}/{total}] {plain_text(topic.get('title', ''))[:52]}")
+        action = learn_one_topic(page, eid, topic, args, attempts=3)
+        if action == "quiz":
+            quiz_unlocked = True
+            print("   🔓 แบบทดสอบถูกปลดล็อกแล้ว — จะเรียนบทที่เหลือให้ครบก่อน")
+        if i < total:
+            stage_topic(page, eid, str(topics[i]["id"]))
+            page.wait_for_timeout(500)
+        if action == "failed":
+            print("   ⚠️ บทนี้ยังไม่ผ่าน — จะลองซ้ำในรอบสอง")
 
-        try:
-            html = page.content()
-        except Exception:
-            html = ""
-        m = TOPIC_STATUS_RE.search(html)
-        if not m:
-            print(f"   ⚠️ [{i}/{len(topics)}] {title} — หา enroll2topic id ไม่เจอ")
-            continue
+    # รอบสอง: เฉพาะบทที่ยังไม่ 100% (ทำจนกว่าจะผ่าน)
+    rows = parse_course_topic_rows(page, eid)
+    missing = [
+        t for t in topics
+        if rows.get(str(t["id"]), {}).get("progress", 0) < 100
+    ]
+    if missing:
+        print(f"\n🔁 ตรวจพบ {len(missing)} บทที่ยังไม่ 100% — ลองซ้ำอีกรอบ")
+        for topic in missing:
+            action = learn_one_topic(page, eid, topic, args, attempts=2)
+            if action == "quiz":
+                quiz_unlocked = True
 
-        e2t = m.group(1)
-        seconds = parse_duration_seconds(topic.get("duration"))
-        try:
-            res = page.evaluate(TOPIC_COMPLETE_JS, {"id": e2t, "duration": seconds})
-        except Exception as e:
-            print(f"   ⚠️ [{i}/{len(topics)}] {title} — เรียก API ไม่สำเร็จ: {type(e).__name__}")
-            continue
-
-        st = res.get("status") or {}
-        data = st.get("json") or {}
-        chk = data.get("chk") if isinstance(data, dict) else None
-        if st.get("status") == 200:
-            ok += 1
-            print(f"   ✅ [{i}/{len(topics)}] {title} — 100% (ถัดไป: {chk or '-'})")
-        else:
-            print(f"   ⚠️ [{i}/{len(topics)}] {title} — API ตอบ HTTP {st.get('status')}")
-
-    print(f"   รวม {ok}/{len(topics)} บท")
-    return ok == len(topics)
+    # ตรวจรอบสุดท้าย
+    rows = parse_course_topic_rows(page, eid)
+    all_tids = [str(t["id"]) for t in topics]
+    verified = [tid for tid in all_tids if rows.get(tid, {}).get("progress", 0) >= 100]
+    print(f"\n   📊 ตรวจสอบ: ผ่านแล้ว {len(verified)}/{total} บท")
+    if len(verified) >= total:
+        return True
+    if quiz_unlocked:
+        print("   ℹ️ บางบทอาจไม่ขึ้น 100% แต่เว็บปลดล็อกแบบทดสอบแล้ว — ทำข้อสอบต่อได้")
+        return True
+    return False
 
 
 def quiz_landing_url(eid: int, kind: str, slug: str) -> str:
@@ -1143,23 +1751,20 @@ def solve_quiz(page: Page, eid: int, quiz: dict, args, exam_links: Optional[dict
     if args.dump:
         dump_page(page, f"quiz_{qid}_landing")
 
-    # ถือว่าทำแล้วเฉพาะเมื่อไม่มีปุ่มเริ่มสอบ และมีประวัติการสอบว่า "ทำแล้ว"
+    # ตรวจประวัติการสอบก่อน: ผ่านแล้ว = ข้ามทันที (ไม่เสียเวลาทำซ้ำ)
+    # และต้องไม่เริ่มใหม่ถ้าเคยสอบแต่ยังไม่ผ่านโดยไม่มีสิทธิ์สอบเหลือ
+    history = read_exam_history(page)
+    if exam_history_passed(history):
+        print(f"   ✅ ชุดนี้ผ่านแล้ว ({exam_history_summary(history)}) — ข้าม ไม่ทำซ้ำ")
+        return True
+    if history:
+        print(f"   📜 เคยสอบแล้วแต่ยังไม่ผ่าน ({exam_history_summary(history)})")
+
     if page.locator("#btnExam").count() == 0:
-        history = ""
-        try:
-            if page.locator(".table-history tbody").count() > 0:
-                history = page.eval_on_selector(
-                    ".table-history tbody", "el => el.innerText"
-                ) or ""
-        except Exception:
-            pass
-        if "ทำแล้ว" in history:
-            print("   ✅ ชุดนี้ทำแล้วก่อนหน้านี้ — ข้าม")
-            result = read_result(page)
-            if result:
-                print(f"   📊 {result}")
-            return True
-        print("   ⚠️ ไม่พบปุ่มเริ่มสอบ (อาจยังไม่ปลดล็อก หรือสิทธิ์การสอบครบแล้ว)")
+        if history:
+            print("   ⚠️ ไม่พบปุ่มเริ่มสอบ — อาจใช้สิทธิ์สอบครบแล้ว")
+        else:
+            print("   ⚠️ ไม่พบปุ่มเริ่มสอบ (อาจยังไม่ปลดล็อก หรือสิทธิ์การสอบครบแล้ว)")
         return False
 
     form = page.evaluate(EXAM_FORM_JS)
@@ -1254,36 +1859,47 @@ def process_course(page: Page, ctx, url: str, args) -> bool:
         return False
 
     print(f"   ชื่อคอร์ส: {plain_text(course.get('title', ''))}")
-    quizzes = build_quiz_bank(course)
-    if not quizzes:
-        print("ℹ️ คอร์สนี้ไม่มีแบบทดสอบ")
-        return True
+    all_quizzes = build_quiz_bank(course)
+    plan = course_plan(course)
+    describe_course_plan(course, plan, all_quizzes)
 
-    print("   แบบทดสอบที่พบ:")
-    for q in quizzes:
-        n_correct = sum(1 for x in q["questions"] for o in x["options"] if o["correct"])
-        print(f"     • [{q['kind']}] {q['title']} — {len(q['questions'])} ข้อ, เฉลย {n_correct} ตัวเลือก")
-
+    quizzes = list(all_quizzes)
     if args.only:
         wanted = {x.strip().lower() for x in args.only.split(",") if x.strip()}
         quizzes = [q for q in quizzes if q["kind"] in wanted]
         if not quizzes:
-            print(f"⚠️ ไม่พบชุดที่ตรงกับ --only {args.only}")
-            return True
+            print(f"⚠️ ไม่พบชุดที่ตรงกับ --only {args.only} — จะเรียนบทเรียนอย่างเดียว")
     elif not args.survey:
         # ค่าเริ่มต้น: ทำเฉพาะแบบทดสอบ ไม่ทำแบบสอบถามความพึงพอใจ
         quizzes = [q for q in quizzes if q["kind"] != "survey"]
+
+    if quizzes:
+        print("\n   แบบทดสอบที่จะทำ:")
+        for q in quizzes:
+            n_correct = sum(1 for x in q["questions"] for o in x["options"] if o["correct"])
+            print(
+                f"     • [{q['kind']}] {q['title']} — "
+                f"{len(q['questions'])} ข้อ, เฉลย {n_correct} ตัวเลือก"
+            )
 
     eid = args.eid or enroll_course(page, ctx, cid)
     if not eid:
         print("   ℹ️ ถ้ารู้ enroll id แล้ว สามารถรันซ้ำด้วย --eid <ตัวเลข> ได้")
         return False
 
-    # ทำเครื่องหมายบทเรียนว่าจบ เพื่อปลดล็อก post-test/exam (ไม่ต้องดูวิดีโอ)
+    # เรียนบทเรียนให้ครบก่อน เพื่อปลดล็อก post-test/exam
+    topics_ok = True
     if args.no_topics:
-        print("\n⏭️ ข้ามการทำเครื่องหมายบทเรียน (--no-topics)")
+        print("\n⏭️ ข้ามการเรียนบทเรียน (--no-topics)")
     else:
-        complete_topics(page, course, eid)
+        topics_ok = complete_topics(page, course, eid, args)
+        if not topics_ok:
+            print("   ⚠️ บทเรียนยังไม่ครบ 100% — จะลองทำแบบทดสอบต่อ (ถ้าปลดล็อกแล้ว)")
+
+    # คอร์สเรียนล้วน (หรือ --only ไม่ตรงกับชุดไหน) = เรียนจบแล้วถือว่าเสร็จ
+    if not quizzes:
+        print("\nℹ️ คอร์สนี้มีแต่บทเรียน (ไม่มีแบบทดสอบที่ต้องทำ) — เรียนจบแล้ว")
+        return topics_ok
 
     # ต้องทำตามลำดับ pre -> post -> exam
     quizzes.sort(key=lambda q: QUIZ_ORDER.get(q["kind"], 9))
@@ -1319,7 +1935,7 @@ def main() -> None:
     ap.add_argument("--dump", action="store_true", help="เก็บ HTML ทุกหน้าไว้ใน _set_dumps")
     ap.add_argument("--eid", type=int, default=0, help="ระบุ enroll id เอง (ข้ามขั้นลงทะเบียน)")
     ap.add_argument("--no-pause", action="store_true", help="ไม่ต้องรอ Enter เมื่อจบ (สำหรับรันอัตโนมัติ)")
-    ap.add_argument("--no-topics", action="store_true", help="ข้ามการทำเครื่องหมายบทเรียนว่าจบ (ใช้เมื่อปลดล็อกข้อสอบแล้ว)")
+    ap.add_argument("--no-topics", action="store_true", help="ข้ามการเรียนบทเรียน (ใช้เมื่อปลดล็อกข้อสอบแล้ว)")
     args = ap.parse_args()
 
     links = load_links(args.links_file, list(args.urls))
@@ -1357,6 +1973,7 @@ def main() -> None:
             viewport={"width": 1440, "height": 900},
             args=["--start-maximized"],
         )
+        restore_session(ctx)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
         course_url = course_info_url(links[0])
@@ -1383,6 +2000,7 @@ def main() -> None:
                 input("👉 กด [Enter] เพื่อปิดเบราว์เซอร์: ")
             except EOFError:
                 pass
+        save_session(ctx)
         ctx.close()
 
 
