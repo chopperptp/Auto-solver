@@ -537,7 +537,8 @@ _GENERIC_GROUP_JS = """
   let cur = node;
   for (let i = 0; i < 10 && cur; i++) {
     let t = (cur.innerText || '').replace(/\\s+/g, ' ');
-    texts.forEach(ot => { if (ot) t = t.split(ot).join(' '); });
+    // ลบตัวเลือกที่ยาวก่อน กันเศษข้อความเหลือ (เช่น "I., II. และ III." มี "II. และ III." อยู่ข้างใน)
+    [...texts].sort((a, b) => b.length - a.length).forEach(ot => { if (ot) t = t.split(ot).join(' '); });
     t = t.split(/\\s+/).filter(w => w && !NOISE.test(w)).join(' ').trim();
     t = t.replace(/^\\d+\\s*[.)]\\s*/, '');
     if (t.length) { statement = t; break; }
@@ -556,6 +557,7 @@ def extract_questions_generic(page: Page) -> list[Question]:
     radios = page.locator("input[type=radio]")
     groups: dict[str, list[str]] = {}   # name -> list of value
     order: list[str] = []
+    visible: dict[str, bool] = {}       # name -> มีตัวเลือกที่มองเห็นจริงไหม
 
     for radio in radios.all():
         try:
@@ -566,11 +568,19 @@ def extract_questions_generic(page: Page) -> list[Question]:
             if name not in groups:
                 groups[name] = []
                 order.append(name)
+                visible[name] = False
             groups[name].append(value)
+            if not visible[name]:
+                try:
+                    visible[name] = radio.is_visible()
+                except Exception:
+                    pass
         except Exception:
             continue
 
     for name in order:
+        if not visible.get(name, True):
+            continue
         try:
             data = page.evaluate(_GENERIC_GROUP_JS, name)
             if not data:

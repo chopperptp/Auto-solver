@@ -1,4 +1,4 @@
-# Auto-solver แบบทดสอบออนไลน์ (Dek-D / Thai MOOC / อื่นๆ)
+# Auto-solver แบบทดสอบออนไลน์ (Dek-D / Thai MOOC / SET e-Learning / อื่นๆ)
 
 ใช้ Gemini AI อ่านโจทย์ เลือกคำตอบ แล้วคลิกเลือกในเบราว์เซอร์อัตโนมัติ (Playwright)
 
@@ -21,7 +21,9 @@ GEMINI_API_KEY=xxxxx
 |---|---|
 | `quiz_solver.py` | **ตัวทำข้อสอบทั่วไปในเบราว์เซอร์** — Dek-D, เว็บอื่นๆ (auto-detect), และโหมด `--learn` |
 | `thaimooc_bot.py` | **ตัวทำ Thai MOOC** — ล็อกอินเอง แล้วไล่เรียน + ทำแบบทดสอบทีละคอร์สจนครบจากไฟล์ลิงก์ |
+| `set_bot.py` | **ตัวทำ SET e-Learning** — ล็อกอินเอง → ลงทะเบียน → ทำแบบทดสอบทุกชุด (ใช้เฉลยจาก API + AI สำรอง) |
 | `thaimooc_links.txt` | 📥 **ไฟล์ใส่ลิงก์คอร์ส Thai MOOC** (1 บรรทัด = 1 คอร์ส) |
+| `set_links.txt` | 📥 **ไฟล์ใส่ลิงก์คอร์ส SET e-Learning** (1 บรรทัด = 1 คอร์ส) |
 | `quiz_links.txt` | 📥 **ไฟล์ใส่ลิงก์แบบทดสอบทั่วไป** (Dek-D ฯลฯ) ใช้กับ `quiz_solver.py` |
 | `README.md` | คู่มือนี้ |
 | `lessons_cache.json` | เนื้อหาบทเรียนที่ดึงไว้ (คำบรรยายวิดีโอ + เอกสาร) ใช้เป็นบริบทให้ AI — สร้างอัตโนมัติ |
@@ -46,7 +48,14 @@ GEMINI_API_KEY=xxxxx
 |---|---|---|
 | ทุกบรรทัด | `https://www.dek-d.com/quiz/supertest/27994/` | ทำแบบทดสอบทีละลิงก์ (ระบบเดาโปรไฟล์ให้เอง) |
 
-### กติกาการใส่ลิงก์ (ทั้ง 2 ไฟล์)
+### `set_links.txt` (สำหรับ SET e-Learning)
+
+| ที่ใส่ | ใส่อะไร | ผลลัพธ์ |
+|---|---|---|
+| ทุกบรรทัด | `https://elearning.set.or.th/SETGroup/courses/299/info?site=web` | ลงทะเบียน (ถ้ายังไม่ลง) แล้วทำแบบทดสอบทุกชุดของคอร์ส |
+| ใส่แค่ตัวเลข | `299` | คอร์สเดียวกับลิงก์ข้างบน |
+
+### กติกาการใส่ลิงก์ (ทั้ง 3 ไฟล์)
 
 - 1 บรรทัด = 1 ลิงก์
 - ขึ้นต้นด้วย `#` = คอมเมนต์ (ข้ามไป ใช้กำกับคอมเมนต์/จดว่าทำไหนแล้วได้)
@@ -118,7 +127,61 @@ python thaimooc_bot.py --links-file my.txt    # อ่านลิงก์จ�
 
 ---
 
-## 2) เว็บแบบทดสอบทั่วไป (Dek-D ฯลฯ) — `quiz_solver.py`
+## 2) SET e-Learning (`elearning.set.or.th`) — `set_bot.py`
+
+### ระบบของ SET
+
+| อะไร | ที่อยู่ |
+|---|---|
+| หน้าคอร์ส | `https://elearning.set.or.th/SETGroup/courses/299/info?site=web` |
+| ล็อกอิน | SET Member — `https://member.set.or.th/set-member/login` (สคริปต์พาไปให้เอง) |
+| หน้าเรียน / ข้อสอบ | `https://elearning.set.or.th/SETGroup/enroll/<enroll_id>/exam/<quiz_id>` |
+
+### ขั้นตอน
+
+**1) ใส่ลิงก์คอร์ส** ใน **`set_links.txt`**
+
+```
+https://elearning.set.or.th/SETGroup/courses/299/info?site=web
+299
+```
+
+**2) รัน**
+
+```bash
+python set_bot.py
+```
+
+ระบบจะ:
+1. เปิดเบราว์เซอร์ไปที่หน้าคอร์ส → กดปุ่ม **เข้าสู่ระบบ** → พาไปหน้า SET Member
+2. **คุณล็อกอินเองด้วยอีเมล/รหัสผ่าน** (รอสูงสุด 20 นาที ไม่ต้องกดอะไรใน Terminal)
+   - session ถูกจำไว้ใน `browser_profile/` → ครั้งต่อไปไม่ต้องล็อกอินใหม่
+3. **ลงทะเบียนคอร์สให้อัตโนมัติ** (ถ้ายังไม่ลงทะเบียน)
+4. ดึงรายการแบบทดสอบ + **เฉลยจาก API ของคอร์ส** แล้วไล่ทำทีละชุด:
+   - `Pre-Test` (ก่อนเรียน), `Examination` (วัดความรู้), `Post-Test` (หลังเรียน)
+   - จับคู่โจทย์บนหน้าจอกับเฉลย — ทนต่อการ **สลับข้อ/สลับตัวเลือก** และป้าย `ก. ข. ค.`
+   - ข้อไหนจับคู่ไม่ได้ → ถาม Gemini ช่วยตอบ
+   - แบบสอบถามความพึงพอใจ (Survey) **ข้ามเป็นค่าเริ่มต้น**
+5. แสดงคะแนน/ผลลัพธ์ท้ายแต่ละชุด แล้วสรุปทั้งคอร์ส
+
+### ตัวเลือก
+
+```bash
+python set_bot.py --list                  # ดูรายการแบบทดสอบของคอร์ส แล้วออก (ไม่ต้องล็อกอิน)
+python set_bot.py --only exam             # ทำเฉพาะชุด: pre, exam, post (คั่นด้วย ,)
+python set_bot.py --no-ai                 # ใช้เฉพาะเฉลยจาก API ไม่เรียก Gemini เลย
+python set_bot.py --survey                # ทำแบบสอบถามความพึงพอใจด้วย (เลือกตัวเลือกแรก)
+python set_bot.py --dump                  # เก็บ HTML ทุกหน้าไว้ใน _set_dumps/ (ไว้ debug)
+python set_bot.py --eid 12345             # ระบุ enroll id เอง (ถ้าลงทะเบียนอัตโนมัติไม่ได้)
+python set_bot.py "https://elearning.set.or.th/SETGroup/courses/299/info?site=web"
+python set_bot.py --links-file my.txt     # อ่านลิงก์จากไฟล์อื่น
+```
+
+> ถ้าสคริปต์หาโจทย์/ปุ่มไม่เจอ ให้รันด้วย `--dump` แล้วส่งไฟล์ใน `_set_dumps/` มาให้ปรับ selector
+
+---
+
+## 3) เว็บแบบทดสอบทั่วไป (Dek-D ฯลฯ) — `quiz_solver.py`
 
 ```bash
 python quiz_solver.py                                   # อ่านลิงก์จาก quiz_links.txt (ถ้าไฟล์ว่างจะใช้ Dek-D ค่าเริ่มต้น)
@@ -144,9 +207,9 @@ python quiz_solver.py <url> --learn                     # โหมดเรี�
 ## เว็บที่ต้อง login
 
 1. รันสคริปต์ → สคริปต์จะเปิดหน้า login ให้ → **ล็อกอินเอง**
-   - Thai MOOC: สคริปต์กดปุ่ม **ThaiD** ให้อัตโนมัติ → สแกน QR ด้วยแอป ThaiD
-2. กด Enter กลับมาที่ Terminal → สคริปต์ทำงานต่อ
-3. session ถูกจดจำไว้ในโฟลเดอร์ `browser_profile/` → ครั้งหน้าไม่ต้องล็อกอินใหม่
+   - Thai MOOC: สคริปต์กดปุ่ม **ThaiD** ให้อัตโนมัติ → สแกน QR ด้วยแอป ThaiD แล้วกด Enter ที่ Terminal
+   - SET e-Learning: ล็อกอินด้วยบัญชี SET Member (อีเมล/รหัสผ่าน) — สคริปต์รอและทำงานต่อให้เอง
+2. session ถูกจดจำไว้ในโฟลเดอร์ `browser_profile/` → ครั้งหน้าไม่ต้องล็อกอินใหม่
 
 ## เพิ่มเว็บใหม่
 
@@ -173,7 +236,9 @@ python quiz_solver.py <url> --learn                     # โหมดเรี�
 | ขึ้น "ยังไม่เห็นว่าล็อกอิน" | ล็อกอินให้เสร็จก่อน แล้วกด Enter ที่ Terminal อีกครั้ง |
 | `Anonymous users do not have permission...` | ยังไม่ล็อกอิน หรือยังไม่ enroll คอร์ส — สคริปต์จะกด Enroll ให้เองหลังล็อกอิน |
 | หาข้อสอบไม่เจอ | สคริปต์จะบันทึกหน้าไว้เป็น `debug_page.html` / `debug_quiz.html` — ส่งไฟล์นั้นมาให้ปรับ selector |
-| อยากดูรายการลิงก์ก่อนรัน | `python thaimooc_bot.py --list` |
+| SET: ล็อกอินไม่ผ่าน / บัญชีถูกระงับ | ระบบของ SET จะระงับบัญชีชั่วคราวเมื่อใส่รหัสผิดหลายครั้ง — ใช้ "ลืมรหัสผ่าน" รีเซ็ต หรือรอแล้วลองใหม่ |
+| SET: หาโจทย์/ปุ่มไม่เจอ | `python set_bot.py --dump` แล้วดูไฟล์ใน `_set_dumps/` |
+| อยากดูรายการลิงก์ก่อนรัน | `python thaimooc_bot.py --list` หรือ `python set_bot.py --list` |
 
 ## หมายเหตุ
 
