@@ -135,44 +135,44 @@ python thaimooc_bot.py --links-file my.txt    # อ่านลิงก์จ�
 |---|---|
 | หน้าคอร์ส | `https://elearning.set.or.th/SETGroup/courses/299/info?site=web` |
 | ล็อกอิน | SET Member — `https://member.set.or.th/set-member/login` (สคริปต์พาไปให้เอง) |
-| หน้าเรียน / ข้อสอบ | `https://elearning.set.or.th/SETGroup/enroll/<enroll_id>/exam/<quiz_id>` |
+| หน้าเริ่มสอบ | `/SETGroup/enroll/<enroll_id>/exam/pre-test`, `/exam/post-test`, `/exam/exam` |
+| หน้าคะแนน | `/SETGroup/enroll/<enroll_id>/exam/<attempt_id>/score` |
+| หน้าเรียน | `/SETGroup/enroll/<enroll_id>/topics/<topic_id>` |
 
-### ขั้นตอน
-
-**1) ใส่ลิงก์คอร์ส** ใน **`set_links.txt`**
+### ลำดับของคอร์ส SET
 
 ```
-https://elearning.set.or.th/SETGroup/courses/299/info?site=web
-299
+Pre-Test → บทเรียนทุกบท (ต้อง 100%) → Post-Test → Examination (Final) → Survey
 ```
 
-**2) รัน**
-
-```bash
-python set_bot.py
-```
-
-ระบบจะ:
+สคริปต์จะ:
 1. เปิดเบราว์เซอร์ไปที่หน้าคอร์ส → กดปุ่ม **เข้าสู่ระบบ** → พาไปหน้า SET Member
 2. **คุณล็อกอินเองด้วยอีเมล/รหัสผ่าน** (รอสูงสุด 20 นาที ไม่ต้องกดอะไรใน Terminal)
    - session ถูกจำไว้ใน `browser_profile/` → ครั้งต่อไปไม่ต้องล็อกอินใหม่
 3. **ลงทะเบียนคอร์สให้อัตโนมัติ** (ถ้ายังไม่ลงทะเบียน)
-4. ดึงรายการแบบทดสอบ + **เฉลยจาก API ของคอร์ส** แล้วไล่ทำทีละชุด:
-   - `Pre-Test` (ก่อนเรียน), `Examination` (วัดความรู้), `Post-Test` (หลังเรียน)
-   - จับคู่โจทย์บนหน้าจอกับเฉลย — ทนต่อการ **สลับข้อ/สลับตัวเลือก** และป้าย `ก. ข. ค.`
-   - ข้อไหนจับคู่ไม่ได้ → ถาม Gemini ช่วยตอบ
-   - แบบสอบถามความพึงพอใจ (Survey) **ข้ามเป็นค่าเริ่มต้น**
-5. แสดงคะแนน/ผลลัพธ์ท้ายแต่ละชุด แล้วสรุปทั้งคอร์ส
+4. **ทำเครื่องหมายบทเรียนทุกบทว่าจบผ่าน API** เพื่อปลดล็อก Post-Test/Examination
+   — ไม่ต้องดูวิดีโอจริง (ข้ามขั้นนี้ด้วย `--no-topics`)
+5. ดึง **เฉลยจาก API สาธารณะของคอร์ส** แล้วทำข้อสอบตามลำดับ:
+   - `Pre-Test` → `Post-Test` → `Examination` (Final)
+   - จับคู่ด้วย **question id + answer id** ก่อน (ทนต่อการสลับข้อ/สลับตัวเลือก)
+   - ถ้า id ไม่ตรง จะเทียบข้อความและชุดตัวเลือกให้
+   - **ถ้าจับคู่ไม่ครบทุกข้อ จะไม่เริ่มสอบ** เพื่อไม่เสียสิทธิ์สอบที่มีจำนวนครั้งจำกัด
+   - ชุดที่ทำแล้วจะถูกข้าม โดยดูจากประวัติการสอบที่ขึ้นว่า “ทำแล้ว”
+6. แสดงคะแนน/ผลลัพธ์ท้ายแต่ละชุด แล้วสรุปทั้งคอร์ส
+
+> **Final exam สุ่ม 10 ข้อจากคลัง 15 ข้อ** และ API สาธารณะก็สุ่มคืนมาครั้งละ 10 ข้อ
+> สคริปต์จึงเรียก API หลายรอบแล้ว merge จนได้คลังครบ 15 ข้อก่อนจับคู่
 
 ### ตัวเลือก
 
 ```bash
 python set_bot.py --list                  # ดูรายการแบบทดสอบของคอร์ส แล้วออก (ไม่ต้องล็อกอิน)
-python set_bot.py --only exam             # ทำเฉพาะชุด: pre, exam, post (คั่นด้วย ,)
-python set_bot.py --no-ai                 # ใช้เฉพาะเฉลยจาก API ไม่เรียก Gemini เลย
+python set_bot.py --only exam             # ทำเฉพาะชุด: pre, post, exam (คั่นด้วย ,)
 python set_bot.py --survey                # ทำแบบสอบถามความพึงพอใจด้วย (เลือกตัวเลือกแรก)
 python set_bot.py --dump                  # เก็บ HTML ทุกหน้าไว้ใน _set_dumps/ (ไว้ debug)
-python set_bot.py --eid 12345             # ระบุ enroll id เอง (ถ้าลงทะเบียนอัตโนมัติไม่ได้)
+python set_bot.py --eid 26738992          # ระบุ enroll id เอง (ข้ามขั้นลงทะเบียน)
+python set_bot.py --no-topics             # ข้ามการมาร์กบทเรียน (ใช้เมื่อปลดล็อกข้อสอบแล้ว)
+python set_bot.py --no-pause              # ไม่ต้องรอ Enter เมื่อจบ (สำหรับรันอัตโนมัติ)
 python set_bot.py "https://elearning.set.or.th/SETGroup/courses/299/info?site=web"
 python set_bot.py --links-file my.txt     # อ่านลิงก์จากไฟล์อื่น
 ```
@@ -237,6 +237,10 @@ python quiz_solver.py <url> --learn                     # โหมดเรี�
 | `Anonymous users do not have permission...` | ยังไม่ล็อกอิน หรือยังไม่ enroll คอร์ส — สคริปต์จะกด Enroll ให้เองหลังล็อกอิน |
 | หาข้อสอบไม่เจอ | สคริปต์จะบันทึกหน้าไว้เป็น `debug_page.html` / `debug_quiz.html` — ส่งไฟล์นั้นมาให้ปรับ selector |
 | SET: ล็อกอินไม่ผ่าน / บัญชีถูกระงับ | ระบบของ SET จะระงับบัญชีชั่วคราวเมื่อใส่รหัสผิดหลายครั้ง — ใช้ "ลืมรหัสผ่าน" รีเซ็ต หรือรอแล้วลองใหม่ |
+| SET: ขึ้นว่าทำข้อสอบแล้ว แต่ในเว็บยังไม่ได้ทำ | เกิดจากเข้า URL ผิด (`/exam/<quiz_id>` เป็นหน้าเปล่า) — ตัวสคริปต์แก้ให้ใช้ `/exam/pre-test`, `/exam/post-test`, `/exam/exam` แล้ว ถ้ายังเจอให้รัน `--dump` แล้วดู URL ใน `_set_dumps/` |
+| SET: จับคู่เฉลยไม่ครบ | Final exam สุ่ม 10 ข้อจากคลัง 15 ข้อ — สคริปต์ดึง API หลายรอบเพื่อรวมคลังให้ครบแล้ว ถ้ายังขาด ให้ดูโจทย์ใน `_set_dumps/quiz_<id>_landing.html` แล้วรันซ้ำ |
+| SET: Post-Test/Examination ยังไม่ปลดล็อก | ต้องให้บทเรียนทุกบทเป็น 100% ก่อน — สคริปต์มาร์กให้อัตโนมัติผ่าน API (ไม่ต้องดูวิดีโอ) ตรวจว่าไม่ได้ใช้ `--no-topics` |
+| SET: session หลุดระหว่างรัน | SET อาจหมดอายุ session เร็วกว่าปกติ — ล็อกอินใหม่ในหน้าต่างที่สคริปต์เปิดให้ แล้วสคริปต์จะทำงานต่อ |
 | SET: หาโจทย์/ปุ่มไม่เจอ | `python set_bot.py --dump` แล้วดูไฟล์ใน `_set_dumps/` |
 | อยากดูรายการลิงก์ก่อนรัน | `python thaimooc_bot.py --list` หรือ `python set_bot.py --list` |
 

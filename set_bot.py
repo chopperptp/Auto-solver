@@ -24,6 +24,7 @@ import json
 import re
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -119,18 +120,155 @@ def load_links(path: str, extra: list[str]) -> list[str]:
     return out
 
 
-def fetch_course_json(ctx, cid: str) -> Optional[dict]:
+BANK_CACHE_DIR = HERE / "_set_banks"
+
+
+def _api_headers(cid: str) -> dict:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "th-TH,th;q=0.9,en;q=0.8",
+        "Referer": f"{BASE}/{GROUP}/courses/{cid}/info",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+
+def fetch_course_json(ctx, cid: str, retries: int = 4) -> Optional[dict]:
+    """ดึงข้อมูลคอร์สจาก API สาธารณะ (ไม่ต้องล็อกอิน)
+
+    ใช้ urllib แทน ctx.request เพราะ API มีระบบกันบอท (Incapsula)
+    ที่มักท้าทาย request จากเบราว์เซอร์แบบ headless
+    """
     url = f"{BASE}/api/site/groups/{GROUP}/courses/{cid}"
-    for i in range(3):
+    headers = _api_headers(cid)
+    for attempt in range(retries):
         try:
-            r = ctx.request.get(url, timeout=90000, headers={"Accept": "application/json"})
-            if r.ok:
-                return r.json()
-            print(f"   ⚠️ ดึงข้อมูลคอร์สไม่สำเร็จ (HTTP {r.status})")
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = r.read().decode("utf-8", "replace")
+            text = body.lstrip("\ufeff \t\r\n")
+            if text.startswith("{") or text.startswith("["):
+                return json.loads(text)
+            head = text[:300].lower()
+            if "<html" in head or "_incapsula_resource" in head:
+                print("   ⚠️ API ถูกระบบกันบอทชั่วคราว — รอแล้วลองใหม่")
+                time.sleep(3 + attempt * 2)
+                continue
+            print("   ⚠️ API ตอบรูปแบบไม่รู้จัก")
         except Exception as e:
             print(f"   ⚠️ ดึงข้อมูลคอร์สไม่สำเร็จ ({type(e).__name__})")
-        time.sleep(2)
+        time.sleep(2 + attempt)
     return None
+
+
+def merge_quiz_questions(dst: dict, src: dict) -> bool:
+    """รวมข้อสอบจาก src เข้า dst (กันซ้ำด้วย id) -> True ถ้ามีข้อใหม่"""
+    added = False
+    for key in QUIZ_KINDS:
+        dq = dst.get(key) or {}
+        sq = src.get(key) or {}
+        if not dq or not sq:
+            continue
+        if not isinstance(dq.get("questions"), list):
+            dq["questions"] = []
+        seen = {str(q.get("id")) for q in dq["questions"]}
+        for q in sq.get("questions") or []:
+            qid = str(q.get("id"))
+            if qid and qid not in seen:
+                dq["questions"].append(q)
+                seen.add(qid)
+                added = True
+    return added
+
+
+def bank_cache_path(cid: str) -> Path:
+    return BANK_CACHE_DIR / f"{cid}.json"
+
+
+def load_bank_cache(course: dict, cid: str) -> bool:
+    """รวมคลังข้อสอบที่เคยเก็บไว้ใน _set_banks/<cid>.json"""
+    p = bank_cache_path(cid)
+    if not p.exists():
+        return False
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if str(data.get("course_id")) != str(cid):
+        return False
+    return merge_quiz_questions(course, data.get("quizzes") or {})
+
+
+def save_bank_cache(course: dict, cid: str) -> None:
+    quizzes = {}
+    for key in QUIZ_KINDS:
+        qs = (course.get(key) or {}).get("questions") or []
+        if qs:
+            quizzes[key] = {"questions": qs}
+    if not quizzes:
+        return
+    try:
+        BANK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        bank_cache_path(cid).write_text(
+            json.dumps(
+                {"course_id": str(cid), "quizzes": quizzes},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"   ⚠️ บันทึกแคชข้อสอบไม่สำเร็จ ({type(e).__name__})")
+
+
+def fetch_course_json_full(
+    ctx, cid: str, quiet: int = 10, max_calls: int = 20
+) -> Optional[dict]:
+    """ดึงข้อมูลคอร์สซ้ำๆ เพื่อรวมคลังข้อสอบที่เว็บสุ่มมาให้ทีละชุด
+
+    quiz ที่ random_questions=1 (เช่น final exam) จะคืนข้อสอบมาแค่ 10 ข้อจากคลังจริง
+    การเรียกซ้ำหลายรอบแล้ว merge ด้วย id จะได้เฉลยครบทุกข้อ
+    คลังที่รวมแล้วจะถูกแคชไว้ใน _set_banks/<cid>.json กัน API ล่ม/กันบอท
+    """
+    course = fetch_course_json(ctx, cid)
+    if not course:
+        return None
+
+    cached = load_bank_cache(course, cid)
+
+    random_keys = [k for k in QUIZ_KINDS if (course.get(k) or {}).get("random_questions")]
+    if not random_keys:
+        if cached:
+            print("   📚 ใช้คลังข้อสอบที่แคชไว้")
+        return course
+
+    calls = 1
+    stable = 0
+    fails = 0
+    total = sum(len((course.get(k) or {}).get("questions") or []) for k in random_keys)
+    while quiet > stable and fails < 3 and calls < max_calls:
+        time.sleep(0.7)
+        nxt = fetch_course_json(ctx, cid, retries=1)
+        calls += 1
+        if not nxt:
+            fails += 1
+            continue
+        fails = 0
+        if merge_quiz_questions(course, nxt):
+            stable = 0
+        else:
+            stable += 1
+
+    new_total = sum(len((course.get(k) or {}).get("questions") or []) for k in random_keys)
+    if new_total > total:
+        print(f"   📚 รวมคลังข้อสอบจาก API {calls} ครั้ง: {total} -> {new_total} ข้อ")
+    if cached:
+        print(f"   📚 รวมคลังข้อสอบที่แคชไว้ด้วย (ทั้งหมด {new_total} ข้อ)")
+    save_bank_cache(course, cid)
+    return course
+
 
 
 def plain_text(s: str) -> str:
@@ -153,7 +291,11 @@ def build_quiz_bank(course: dict) -> list[dict]:
                 "id": q.get("id"),
                 "text": plain_text(q.get("questions", "")),
                 "options": [
-                    {"text": plain_text(a.get("answer", "")), "correct": int(a.get("correct") or 0)}
+                    {
+                        "id": a.get("id"),
+                        "text": plain_text(a.get("answer", "")),
+                        "correct": int(a.get("correct") or 0),
+                    }
                     for a in answers
                 ],
             })
@@ -174,8 +316,23 @@ def build_quiz_bank(course: dict) -> list[dict]:
 # 2. ล็อกอิน / ลงทะเบียน
 # ============================================================================
 def is_logged_in(page: Page) -> bool:
+    """ล็อกอินแล้วหรือยัง (ระวังหน้า login ของ member.set.or.th ที่ไม่มีปุ่ม login)"""
     try:
-        return page.locator(".btn-trigger-login").count() == 0
+        url = page.url or ""
+        if "member.set.or.th" in url or "/login" in url.split("?")[0]:
+            return False
+        if "elearning.set.or.th" not in url:
+            return False
+        if page.locator("#btn-logout").count() > 0:
+            return True
+        if page.locator(".btn-trigger-login").count() == 0:
+            # บางหน้า (เช่น SSO) ไม่มีปุ่มนี้แต่ยังไม่ได้ล็อกอิน
+            try:
+                title = page.title() or ""
+            except Exception:
+                title = ""
+            return "ลงชื่อเข้าใช้งาน" not in title and "login" not in url.lower()
+        return False
     except Exception:
         return False
 
@@ -192,6 +349,25 @@ def goto(page: Page, url: str, tries: int = 3, timeout: int = 90000) -> bool:
     return False
 
 
+def settle(page: Page, url: str, timeout: int = 45000) -> bool:
+    """เปิดหน้าและรอจนผ่าน SSO redirect กลับมาที่ elearning (คืน False ถ้าไปติดหน้า login)"""
+    if not goto(page, url):
+        return False
+    deadline = time.time() + timeout / 1000
+    while time.time() < deadline:
+        u = page.url or ""
+        if "member.set.or.th" in u:
+            if "/login" in u:
+                return False
+            page.wait_for_timeout(700)
+            continue
+        if "elearning.set.or.th" in u:
+            page.wait_for_timeout(800)
+            return True
+        page.wait_for_timeout(400)
+    return False
+
+
 def wait_for_login(ctx, page: Page, course_url: str) -> bool:
     """เปิดหน้าเว็บแล้วรอจนผู้ใช้ล็อกอิน (ล็อกอินเองในหน้าต่างเบราว์เซอร์)"""
     goto(page, course_url)
@@ -200,13 +376,16 @@ def wait_for_login(ctx, page: Page, course_url: str) -> bool:
         return True
 
     print("🔐 ยังไม่ล็อกอิน — กำลังพาไปหน้าเข้าสู่ระบบ SET Member ...")
-    try:
-        btn = page.locator(".btn-trigger-login:visible")
-        if btn.count() == 0:
-            btn = page.locator(".btn-trigger-login")
-        btn.first.click(timeout=20000)
-    except Exception as e:
-        print(f"   ⚠️ กดปุ่มเข้าสู่ระบบไม่สำเร็จ: {type(e).__name__}")
+    if "member.set.or.th" in (page.url or ""):
+        print("   ℹ️ หน้านี้คือหน้า login ของ SET Member — ล็อกอินในหน้าต่างนี้ได้เลย")
+    else:
+        try:
+            btn = page.locator(".btn-trigger-login:visible")
+            if btn.count() == 0:
+                btn = page.locator(".btn-trigger-login")
+            btn.first.click(timeout=20000)
+        except Exception as e:
+            print(f"   ⚠️ กดปุ่มเข้าสู่ระบบไม่สำเร็จ: {type(e).__name__}")
 
     print("=" * 62)
     print("👉 ล็อกอินด้วยอีเมล/รหัสผ่าน SET Member ในหน้าต่างเบราว์เซอร์")
@@ -578,154 +757,482 @@ def read_result(page: Page) -> str:
     except Exception:
         return ""
     lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-    hits = [ln for ln in lines if re.search(r"คะแนน|ผ่าน|ไม่ผ่าน|ผลการ|score|passed", ln, re.I)]
+    hits = [
+        ln
+        for ln in lines
+        if re.search(r"คะแนน|ผ่าน|ไม่ผ่าน|ผลการ|ทำแล้ว|score|passed", ln, re.I)
+    ]
     return " | ".join(hits[:8])
 
 
 # ============================================================================
-# 5. ทำแบบทดสอบ 1 ชุด
+# 5. ทำแบบทดสอบ 1 ชุด (ฟอร์มข้อสอบของ SET ถูก render มาพร้อมหน้า)
 # ============================================================================
-def solve_quiz(page: Page, eid: int, quiz: dict, args, exam_links: Optional[dict] = None) -> bool:
-    qid = quiz["id"]
-    link = (exam_links or {}).get(str(qid)) or ""
-    if link.rstrip("/").endswith("/score"):
-        link = ""
-    url = link or f"{BASE}/{GROUP}/enroll/{eid}/exam/{qid}"
-    print(f"\n📝 {quiz['title']} (quiz id={qid}, {len(quiz['questions'])} ข้อ)")
-    print(f"   🔗 {url}")
+# URL หน้า "คำชี้แจง/เริ่มสอบ" ของแต่ละชุด (หน้าสุดท้ายจะเปลี่ยนเป็น /exam/<attempt>/score)
+QUIZ_PATHS = {
+    "pre": ("pre-test",),
+    "post": ("post-test",),
+    "exam": ("exam",),
+    "survey": ("survey",),
+}
 
-    if not goto(page, url):
-        print("   ❌ เปิดหน้าแบบทดสอบไม่สำเร็จ")
-        return False
+QUIZ_ORDER = {"pre": 0, "post": 1, "exam": 2, "survey": 3}
 
-    if "/exam/" not in page.url:
-        print(f"   ⚠️ หน้าไม่ใช่แบบทดสอบ (อยู่ที่ {page.url}) — ลองเปิดจากลิงก์ที่พบในหน้าเรียน")
-        fallback = f"{BASE}/{GROUP}/enroll/{eid}/exam/{qid}"
-        if fallback != url:
-            goto(page, fallback)
-        if "/exam/" not in page.url:
-            print("   ❌ เข้าหน้าแบบทดสอบไม่ได้ (อาจยังไม่ลงทะเบียน/ไม่มีสิทธิ์)")
-            if args.dump:
-                dump_page(page, f"quiz_{qid}_notfound")
-            return False
+EXAM_FORM_JS = r"""
+() => {
+  const form = document.querySelector('#exam-form');
+  if (!form) return null;
+  const questions = [...form.querySelectorAll('fieldset')].map((fs) => {
+    const block = fs.querySelector('.questions-block');
+    const h = fs.querySelector('h4');
+    const inputs = [...fs.querySelectorAll('input.answer-choice')];
+    return {
+      qid: (block && block.getAttribute('data-questions-id')) || fs.getAttribute('data-id') || '',
+      text: h ? (h.innerText || '').trim() : '',
+      options: inputs.map((i) => {
+        let lab = i.closest('label');
+        if (!lab && i.id) lab = form.querySelector("label[for='" + i.id + "']");
+        return {
+          id: String(i.value),
+          type: i.type,
+          text: lab ? (lab.innerText || '').trim() : '',
+          checked: i.checked,
+        };
+      }),
+    };
+  });
+  return {
+    all: parseInt(form.getAttribute('data-all-questions') || '0', 10),
+    questions,
+  };
+}
+"""
 
-    page.wait_for_timeout(2500)
+APPLY_PLAN_JS = r"""
+(plan) => {
+  const res = [];
+  for (const p of plan) {
+    const el = document.querySelector("#exam-form input[name='" + p.qid + "'][value='" + p.aid + "']");
+    if (!el) { res.push({qid: p.qid, ok: false, why: 'ไม่พบ input'}); continue; }
+    if (!el.checked) el.click();
+    if (!el.checked) {
+      el.checked = true;
+      el.dispatchEvent(new Event('change', {bubbles: true}));
+      el.dispatchEvent(new Event('click', {bubbles: true}));
+    }
+    res.push({qid: p.qid, ok: !!el.checked, why: el.checked ? '' : 'ไม่ได้เลือก'});
+  }
+  try { checkSubmitButton(); } catch (e) {}
+  return res;
+}
+"""
 
-    # หน้าเริ่มสอบ / คำชี้แจง (อาจต้องติ๊กยอมรับก่อน)
-    accept_checkboxes(page)
-    clicked = click_first(page, START_LABELS)
-    if clicked:
-        print(f"   ▶️ กด '{clicked}'")
-        page.wait_for_timeout(2000)
-        accept_checkboxes(page)
-        click_confirm_modal(page)
-        page.wait_for_timeout(2500)
+VERIFY_ANSWERS_JS = r"""
+() => {
+  const form = document.querySelector('#exam-form');
+  if (!form) return [];
+  const out = [];
+  for (const fs of form.querySelectorAll('fieldset')) {
+    const first = fs.querySelector('input.answer-choice');
+    if (!first) continue;
+    out.push({
+      qid: first.name,
+      checked: fs.querySelectorAll("input[name='" + first.name + "']:checked").length,
+    });
+  }
+  return out;
+}
+"""
 
-    # ติ๊กยอมรับเงื่อนไข (ถ้ามี)
-    accept_checkboxes(page)
 
-    if args.dump:
-        dump_page(page, f"quiz_{qid}_start")
+TOPIC_STATUS_RE = re.compile(r"enroll2topic_status',\s*\{'id'\s*:\s*'?(\d+)")
 
-    bank = quiz["questions"]
-    is_survey = quiz["kind"] == "survey"
-    answered_total = 0
-    seen_pages = set()
-    stuck = 0
+TOPIC_COMPLETE_JS = r"""
+async ({id, duration}) => {
+  const post = async (url, body) => {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json',
+      },
+      body: new URLSearchParams(body).toString(),
+    });
+    const text = await r.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch (e) {}
+    return {status: r.status, json};
+  };
+  return {
+    duration: await post('/api/site/enroll2topic_duration', {id, duration}),
+    status: await post('/api/site/enroll2topic_status', {id, status: 1}),
+  };
+}
+"""
 
-    # รอให้ข้อสอบโหลด (บางหน้าดึงผ่าน AJAX)
+
+def parse_duration_seconds(text: str) -> int:
+    """'00:23:55' -> 1435"""
     try:
-        page.wait_for_selector("input[type=radio]", timeout=15000)
+        parts = [int(x) for x in (text or "").strip().split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        return parts[-3] * 3600 + parts[-2] * 60 + parts[-1]
+    except Exception:
+        return 0
+
+
+def flat_topics(course: dict) -> list[dict]:
+    out: list[dict] = []
+    for main in course.get("main_topics") or []:
+        for sub in main.get("sub_topics") or []:
+            if sub.get("id"):
+                out.append(sub)
+    return out
+
+
+def complete_topics(page: Page, course: dict, eid: int) -> bool:
+    """ทำเครื่องหมายทุกบทเรียนว่าจบผ่าน API (ไม่ต้องดูวิดีโอ) เพื่อปลดล็อก post-test/exam"""
+    topics = flat_topics(course)
+    if not topics:
+        return True
+
+    print(f"\n🎬 ทำเครื่องหมายบทเรียนว่าจบ {len(topics)} บท (ไม่ต้องดูวิดีโอ)")
+    ok = 0
+    for i, topic in enumerate(topics, 1):
+        tid = str(topic["id"])
+        title = plain_text(topic.get("title", ""))[:52]
+        url = f"{BASE}/{GROUP}/enroll/{eid}/topics/{tid}"
+        if not settle(page, url):
+            if "member.set.or.th" in (page.url or ""):
+                print("   ❌ หลุดล็อกอิน — หยุดทำบทเรียน")
+                return False
+            print(f"   ❌ [{i}/{len(topics)}] {title} — เปิดหน้าไม่ได้")
+            continue
+
+        try:
+            html = page.content()
+        except Exception:
+            html = ""
+        m = TOPIC_STATUS_RE.search(html)
+        if not m:
+            print(f"   ⚠️ [{i}/{len(topics)}] {title} — หา enroll2topic id ไม่เจอ")
+            continue
+
+        e2t = m.group(1)
+        seconds = parse_duration_seconds(topic.get("duration"))
+        try:
+            res = page.evaluate(TOPIC_COMPLETE_JS, {"id": e2t, "duration": seconds})
+        except Exception as e:
+            print(f"   ⚠️ [{i}/{len(topics)}] {title} — เรียก API ไม่สำเร็จ: {type(e).__name__}")
+            continue
+
+        st = res.get("status") or {}
+        data = st.get("json") or {}
+        chk = data.get("chk") if isinstance(data, dict) else None
+        if st.get("status") == 200:
+            ok += 1
+            print(f"   ✅ [{i}/{len(topics)}] {title} — 100% (ถัดไป: {chk or '-'})")
+        else:
+            print(f"   ⚠️ [{i}/{len(topics)}] {title} — API ตอบ HTTP {st.get('status')}")
+
+    print(f"   รวม {ok}/{len(topics)} บท")
+    return ok == len(topics)
+
+
+def quiz_landing_url(eid: int, kind: str, slug: str) -> str:
+    return f"{BASE}/{GROUP}/enroll/{eid}/exam/{slug}"
+
+
+def find_quiz_page(page: Page, eid: int, quiz: dict) -> Optional[str]:
+    """เปิดหน้าเริ่มสอบของชุดนี้ -> คืน URL เมื่อเจอ quizID ตรงกับข้อมูลคอร์ส"""
+    qid = str(quiz["id"])
+    for slug in QUIZ_PATHS.get(quiz["kind"], (quiz["kind"],)):
+        url = quiz_landing_url(eid, quiz["kind"], slug)
+        if not settle(page, url):
+            if "member.set.or.th" in (page.url or ""):
+                return None
+            continue
+        page.wait_for_timeout(800)
+        if "member.set.or.th" in (page.url or ""):
+            return None
+        try:
+            page_qid = page.evaluate(
+                "() => (typeof quizID !== 'undefined') ? String(quizID) : null"
+            )
+        except Exception:
+            page_qid = None
+        if page_qid == qid:
+            return url
+    return None
+
+
+def build_exam_plan(form: dict, bank: list[dict], survey: bool = False) -> tuple[list[dict], list]:
+    """จับคู่ข้อสอบบนหน้าจอกับเฉลย -> (แผนตอบ, ข้อที่จับคู่ไม่ได้)"""
+    plan: list[dict] = []
+    missing: list = []
+    for q in form.get("questions") or []:
+        opts = q.get("options") or []
+        if not opts:
+            missing.append((q, "ไม่พบตัวเลือก"))
+            continue
+
+        # 1) หาข้อในเฉลยจาก question id ก่อน (id ตรงกันเสมอใน SET)
+        item = None
+        for b in bank:
+            if str(b.get("id")) == str(q.get("qid")):
+                item = b
+                break
+        # 2) ไม่เจอ -> เทียบข้อความ
+        if item is None:
+            item = find_bank_question(q.get("text", ""), [o["text"] for o in opts], bank)
+        if item is None and not survey:
+            missing.append((q, "ไม่พบข้อนี้ในเฉลย"))
+            continue
+
+        aid = None
+        if not survey and item is not None:
+            # 2.1) ใช้ id ตัวเลือกจาก API (แม่นสุด รองรับการสลับตัวเลือก)
+            correct_ids = {
+                str(o.get("id")) for o in item.get("options", []) if o.get("correct") == 1
+            }
+            for o in opts:
+                if str(o["id"]) in correct_ids:
+                    aid = str(o["id"])
+                    break
+            # 2.2) เทียบข้อความ
+            if aid is None:
+                idx = correct_option_index(item, [o["text"] for o in opts])
+                if idx is not None:
+                    aid = str(opts[idx]["id"])
+        if survey and aid is None:
+            aid = str(opts[0]["id"])
+
+        if aid is None:
+            missing.append((q, "จับคู่ตัวเลือกที่ถูกไม่ได้"))
+            continue
+        if not any(str(o["id"]) == aid for o in opts):
+            missing.append((q, "ตัวเลือกที่จับคู่ไม่มีในหน้า"))
+            continue
+
+        plan.append({
+            "qid": q["qid"],
+            "aid": aid,
+            "qtext": (q.get("text") or "").replace("\n", " ")[:78],
+            "atext": next((o["text"] for o in opts if str(o["id"]) == aid), "")[:78],
+        })
+    return plan, missing
+
+
+def start_exam(page: Page) -> Optional[str]:
+    """กดปุ่มเริ่มสอบ -> คืนเลขที่สอบ (enroll2quiz) หรือ None ถ้าเริ่มไม่สำเร็จ"""
+    btn = page.locator("#btnExam")
+    if btn.count() == 0:
+        print("   ⚠️ ไม่พบปุ่ม 'เริ่มแบบทดสอบ'")
+        return None
+
+    data = {}
+    try:
+        with page.expect_response(
+            lambda r: "/api/site/enroll2quiz" in r.url, timeout=45000
+        ) as ri:
+            btn.first.click(timeout=20000)
+        try:
+            data = ri.value.json()
+        except Exception:
+            data = {}
+    except Exception as e:
+        print(f"   ⚠️ กดเริ่มสอบแล้วไม่เห็นคำตอบจาก API: {type(e).__name__}")
+        data = {}
+
+    if data.get("is_error"):
+        print(f"   ❌ เริ่มสอบไม่สำเร็จ: {data.get('message') or data}")
+        return None
+
+    try:
+        page.wait_for_selector(".testing-block:not(.d-none)", timeout=25000)
+    except Exception:
+        print("   ⚠️ ไม่เห็นฟอร์มข้อสอบหลังกดเริ่ม (อาจมีป๊อปอัป/เงื่อนไข)")
+        return None
+    page.wait_for_timeout(800)
+
+    attempt = str(data.get("enroll2quiz") or "")
+    if not attempt:
+        try:
+            attempt = page.eval_on_selector("#enroll2quiz", "el => el.value") or ""
+        except Exception:
+            attempt = ""
+    return attempt or "?"
+
+
+def confirm_submit_modal(page: Page) -> Optional[str]:
+    """กดยืนยันในกล่อง jquery-confirm (จำกัดเฉพาะใน .jconfirm)"""
+    try:
+        page.wait_for_selector(".jconfirm", timeout=12000)
+    except Exception:
+        pass
+    for label in ("ยืนยันการส่งคำตอบ", "ยืนยัน", "ตกลง", "OK"):
+        try:
+            loc = page.locator(f".jconfirm button:has-text('{label}')")
+            if loc.count() == 0:
+                continue
+            loc.first.click(timeout=8000)
+            return label
+        except Exception:
+            continue
+    return None
+
+
+def submit_exam(page: Page) -> bool:
+    """ไปข้อสุดท้าย -> กดส่งคำตอบ -> ยืนยัน -> รอหน้า /score"""
+    try:
+        page.evaluate(
+            """() => {
+                const fs = [...document.querySelectorAll('#exam-form fieldset')];
+                if (!fs.length) return;
+                const last = fs[fs.length - 1];
+                try { fieldset(last.getAttribute('data-id')); } catch (e) { last.style.display = 'block'; }
+                try { checkSubmitButton(); } catch (e) {}
+            }"""
+        )
+        page.wait_for_timeout(900)
     except Exception:
         pass
 
-    for step in range(1, 61):
-        page.wait_for_timeout(1200)
+    btn = page.locator(".submit-an-answer:visible")
+    if btn.count() == 0:
+        btn = page.locator(".submit-an-answer")
+    if btn.count() == 0:
+        print("   ❌ ไม่พบปุ่มส่งคำตอบ")
+        return False
 
-        # ถ้ามีข้อสอบให้ตอบ
-        n = solve_one_page(
-            page,
-            bank,
-            use_ai=(not args.no_ai) and (not is_survey),
-            survey=is_survey,
-        )
-        answered_total += n
+    try:
+        btn.first.click(timeout=15000)
+    except Exception as e:
+        print(f"   ❌ กดส่งคำตอบไม่สำเร็จ: {type(e).__name__}")
+        return False
 
-        # สถานะหน้า: เก็บไว้กันวนซ้ำ
-        try:
-            sig = page.evaluate(
-                "() => (document.body.innerText || '').replace(/\\s+/g,' ').slice(0, 400)"
-            )
-        except Exception:
-            sig = ""
-        seen_pages.add(sig)
+    clicked = confirm_submit_modal(page)
+    if clicked:
+        print(f"   📤 ยืนยันส่งคำตอบ ('{clicked}')")
+    else:
+        print("   ⚠️ ไม่พบปุ่มยืนยันในกล่องส่งคำตอบ")
 
-        # กด "ถัดไป" (ถ้ามี)
-        nxt = click_first(page, NEXT_LABELS)
-        if nxt:
-            print(f"   ➡️ {nxt}")
-            page.wait_for_timeout(1500)
-            try:
-                page.wait_for_selector("input[type=radio]", timeout=8000)
-            except Exception:
-                # อาจเด้ง modal ยืนยันการส่งข้อสอบ
-                if click_confirm_modal(page):
-                    print("   📤 ยืนยันการส่งข้อสอบ")
-                    page.wait_for_timeout(3500)
-                    click_confirm_modal(page)
-                    try:
-                        page.wait_for_url(re.compile(r"/score"), timeout=15000)
-                    except Exception:
-                        pass
-                    page.wait_for_timeout(1500)
-                    if args.dump:
-                        dump_page(page, f"quiz_{qid}_after_submit")
-                    break
-            try:
-                new_sig = page.evaluate(
-                    "() => (document.body.innerText || '').replace(/\\s+/g,' ').slice(0, 400)"
-                )
-            except Exception:
-                new_sig = ""
-            if n == 0 and new_sig == sig:
-                stuck += 1
-                if stuck >= 2:
-                    print("   ⚠️ หน้าเดิมไม่เปลี่ยน — หยุดเพื่อกันวนซ้ำ")
-                    break
-            else:
-                stuck = 0
-            continue
+    try:
+        page.wait_for_url(re.compile(r"/exam/\d+/score"), timeout=45000)
+    except Exception:
+        pass
+    page.wait_for_timeout(1500)
+    return "/score" in (page.url or "")
 
-        # กดส่งคำตอบ
-        sub = click_first(page, SUBMIT_LABELS)
-        if sub:
-            print(f"   📤 กด '{sub}'")
-            page.wait_for_timeout(1200)
-            click_confirm_modal(page)
-            page.wait_for_timeout(3500)
-            click_confirm_modal(page)
-            try:
-                page.wait_for_url(re.compile(r"/score"), timeout=15000)
-            except Exception:
-                pass
-            page.wait_for_timeout(1500)
-            if args.dump:
-                dump_page(page, f"quiz_{qid}_after_submit")
-            break
 
-        # ไม่มีปุ่มอะไรแล้ว — จบหรือหน้าผลลัพธ์
+def solve_quiz(page: Page, eid: int, quiz: dict, args, exam_links: Optional[dict] = None) -> bool:
+    qid = quiz["id"]
+    print(f"\n📝 {quiz['title']} (quiz id={qid}, {len(quiz['questions'])} ข้อ)")
+
+    url = find_quiz_page(page, eid, quiz)
+    if not url:
+        print("   ❌ เข้าหน้าแบบทดสอบชุดนี้ไม่ได้")
+        print("      (อาจยังไม่ล็อกอิน หรือยังไม่ปลดล็อกเพราะต้องทำข้อก่อนหน้าให้เสร็จ)")
         if args.dump:
-            dump_page(page, f"quiz_{qid}_step{step}")
-        print("   ℹ️ ไม่พบปุ่มถัดไป/ส่งคำตอบ — หยุดลูป")
-        break
+            dump_page(page, f"quiz_{qid}_notfound")
+        return False
+    print(f"   🔗 {page.url}")
 
-    result = read_result(page)
-    if result:
-        print(f"   📊 ผลลัพธ์: {result}")
     if args.dump:
-        dump_page(page, f"quiz_{qid}_final")
-    print(f"   รวมตอบ {answered_total} ครั้ง")
-    return True
+        dump_page(page, f"quiz_{qid}_landing")
+
+    # ถือว่าทำแล้วเฉพาะเมื่อไม่มีปุ่มเริ่มสอบ และมีประวัติการสอบว่า "ทำแล้ว"
+    if page.locator("#btnExam").count() == 0:
+        history = ""
+        try:
+            if page.locator(".table-history tbody").count() > 0:
+                history = page.eval_on_selector(
+                    ".table-history tbody", "el => el.innerText"
+                ) or ""
+        except Exception:
+            pass
+        if "ทำแล้ว" in history:
+            print("   ✅ ชุดนี้ทำแล้วก่อนหน้านี้ — ข้าม")
+            result = read_result(page)
+            if result:
+                print(f"   📊 {result}")
+            return True
+        print("   ⚠️ ไม่พบปุ่มเริ่มสอบ (อาจยังไม่ปลดล็อก หรือสิทธิ์การสอบครบแล้ว)")
+        return False
+
+    form = page.evaluate(EXAM_FORM_JS)
+    if not form or not form.get("questions"):
+        print("   ⚠️ ไม่พบฟอร์มข้อสอบในหน้านี้ (ไม่เริ่มทำเพื่อกันเสียสิทธิ์)")
+        if args.dump:
+            dump_page(page, f"quiz_{qid}_noform")
+        return False
+
+    is_survey = quiz["kind"] == "survey"
+    print(f"   📄 พบข้อสอบ {len(form['questions'])} ข้อ")
+    plan, missing = build_exam_plan(form, quiz["questions"], survey=is_survey)
+    print(f"   🧩 จับคู่เฉลยได้ {len(plan)}/{len(form['questions'])} ข้อ")
+
+    expected = int(form.get("all") or len(form["questions"]))
+    if missing or len(plan) != expected:
+        for q, why in missing:
+            print(f"      ❌ {why}: {(q.get('text') or '')[:70]}")
+        print("   ⛔ ยังไม่เริ่มทำ เพราะจับคู่เฉลยไม่ครบ (กันเสียสิทธิ์สอบที่มีจำนวนครั้งจำกัด)")
+        return False
+
+    for p in plan:
+        print(f"      • {p['qtext']} -> {p['atext']}")
+
+    # เริ่มทำข้อสอบ (เริ่มตอนนี้เท่านั้น เพื่อไม่ให้เสียเวลาสอบ)
+    print("   ▶️ เริ่มทำแบบทดสอบ ...")
+    attempt = start_exam(page)
+    if not attempt:
+        if args.dump:
+            dump_page(page, f"quiz_{qid}_start_failed")
+        return False
+    print(f"   🔢 เลขที่สอบ: {attempt}")
+
+    # ตอบทุกข้อ (ฟอร์มซ่อนอยู่ แต่คลิกด้วย JS ได้)
+    results = page.evaluate(APPLY_PLAN_JS, plan)
+    answered = sum(1 for r in results if r.get("ok"))
+    failed = [r for r in results if not r.get("ok")]
+    print(f"   ✅ ตอบแล้ว {answered}/{len(plan)} ข้อ")
+    if failed:
+        for r in failed[:5]:
+            print(f"      ⚠️ ข้อ {r['qid']}: {r.get('why')}")
+
+    # ตรวจซ้ำว่าทุกข้อถูกเลือกจริง
+    verify = page.evaluate(VERIFY_ANSWERS_JS)
+    not_ready = [v for v in verify if v.get("checked", 0) < 1]
+    if not_ready:
+        page.evaluate(APPLY_PLAN_JS, plan)
+        page.wait_for_timeout(500)
+        verify = page.evaluate(VERIFY_ANSWERS_JS)
+        not_ready = [v for v in verify if v.get("checked", 0) < 1]
+    if not_ready:
+        print(f"   ❌ ยังมีข้อที่ไม่ได้เลือก {len(not_ready)} ข้อ — หยุดก่อนส่ง")
+        if args.dump:
+            dump_page(page, f"quiz_{qid}_incomplete")
+        return False
+
+    if args.dump:
+        dump_page(page, f"quiz_{qid}_answered")
+
+    ok = submit_exam(page)
+    if ok:
+        result = read_result(page)
+        print(f"   🎉 ส่งคำตอบสำเร็จ — {page.url}")
+        if result:
+            print(f"   📊 ผลลัพธ์: {result}")
+        if args.dump:
+            dump_page(page, f"quiz_{qid}_score")
+        return True
+
+    print(f"   ❌ ส่งคำตอบไม่สำเร็จ (อยู่ที่ {page.url})")
+    if args.dump:
+        dump_page(page, f"quiz_{qid}_submit_failed")
+    return False
 
 
 # ============================================================================
@@ -741,7 +1248,7 @@ def process_course(page: Page, ctx, url: str, args) -> bool:
     print(f"🎓 คอร์ส {cid}: {url}")
     print("=" * 62)
 
-    course = fetch_course_json(ctx, cid)
+    course = fetch_course_json_full(ctx, cid)
     if not course:
         print("❌ ดึงข้อมูลคอร์สไม่ได้ — ตรวจอินเทอร์เน็ตแล้วลองใหม่")
         return False
@@ -772,12 +1279,19 @@ def process_course(page: Page, ctx, url: str, args) -> bool:
         print("   ℹ️ ถ้ารู้ enroll id แล้ว สามารถรันซ้ำด้วย --eid <ตัวเลข> ได้")
         return False
 
-    exam_links = collect_exam_links(page, eid)
+    # ทำเครื่องหมายบทเรียนว่าจบ เพื่อปลดล็อก post-test/exam (ไม่ต้องดูวิดีโอ)
+    if args.no_topics:
+        print("\n⏭️ ข้ามการทำเครื่องหมายบทเรียน (--no-topics)")
+    else:
+        complete_topics(page, course, eid)
+
+    # ต้องทำตามลำดับ pre -> post -> exam
+    quizzes.sort(key=lambda q: QUIZ_ORDER.get(q["kind"], 9))
 
     ok = 0
     for quiz in quizzes:
         try:
-            if solve_quiz(page, eid, quiz, args, exam_links):
+            if solve_quiz(page, eid, quiz, args):
                 ok += 1
         except KeyboardInterrupt:
             raise
@@ -804,6 +1318,8 @@ def main() -> None:
     ap.add_argument("--list", action="store_true", help="แสดงรายการแบบทดสอบแล้วจบ (ไม่ต้องล็อกอิน)")
     ap.add_argument("--dump", action="store_true", help="เก็บ HTML ทุกหน้าไว้ใน _set_dumps")
     ap.add_argument("--eid", type=int, default=0, help="ระบุ enroll id เอง (ข้ามขั้นลงทะเบียน)")
+    ap.add_argument("--no-pause", action="store_true", help="ไม่ต้องรอ Enter เมื่อจบ (สำหรับรันอัตโนมัติ)")
+    ap.add_argument("--no-topics", action="store_true", help="ข้ามการทำเครื่องหมายบทเรียนว่าจบ (ใช้เมื่อปลดล็อกข้อสอบแล้ว)")
     args = ap.parse_args()
 
     links = load_links(args.links_file, list(args.urls))
@@ -823,7 +1339,7 @@ def main() -> None:
             )
             for link in links:
                 cid = course_id_from_url(link)
-                course = fetch_course_json(ctx, cid) if cid else None
+                course = fetch_course_json_full(ctx, cid) if cid else None
                 if not course:
                     print(f"\n❌ {link} — ดึงข้อมูลไม่ได้")
                     continue
@@ -862,10 +1378,11 @@ def main() -> None:
         print(f"🎉 เสร็จ {ok}/{len(links)} คอร์ส")
         print("=" * 62)
 
-        try:
-            input("👉 กด [Enter] เพื่อปิดเบราว์เซอร์: ")
-        except EOFError:
-            pass
+        if not args.no_pause:
+            try:
+                input("👉 กด [Enter] เพื่อปิดเบราว์เซอร์: ")
+            except EOFError:
+                pass
         ctx.close()
 
 

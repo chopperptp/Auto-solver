@@ -5,4 +5,7 @@ __pycache__/
 run_log*.txt
 lessons_cache.json
 _set_dumps/
+_set_banks/
+_probe_out/
+_set_run*.log
 _fake_exam.html
