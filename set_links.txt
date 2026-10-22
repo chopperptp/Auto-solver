@@ -10,7 +10,7 @@
 #  ใส่ลิงก์แบบไหนก็ได้ (ระบบแปลงให้เอง)
 #  ------------------------------------
 #    1) ลิงก์หน้าคอร์ส (คัดลอกจากเบราว์เซอร์ได้เลย)
-#         https://elearning.set.or.th/SETGroup/courses/299/info?site=web
+#        https://elearning.set.or.th/SETGroup/courses/299/info?site=web
 #    2) รหัสคอร์ส
 #         299
 #
@@ -21,4 +21,4 @@
 
 # ▼▼▼▼ วางลิงก์คอร์สตรงใต้บรรทัดนี้ (ทีละบรรทัด) ▼▼▼▼
 
-https://elearning.set.or.th/SETGroup/courses/299/info?site=web&site=web
+https://elearning.set.or.th/SETGroup/courses/770/info
